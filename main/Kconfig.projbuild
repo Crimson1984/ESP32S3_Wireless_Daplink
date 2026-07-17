@@ -1,0 +1,50 @@
+menu "Wireless DATLINK"
+
+choice DATLINK_ROLE
+    prompt "Firmware role"
+    default DATLINK_ROLE_GATEWAY
+
+    config DATLINK_ROLE_GATEWAY
+        bool "Gateway (PC-side)"
+
+    config DATLINK_ROLE_PROBE
+        bool "Probe (MSPM0-side)"
+endchoice
+
+config DATLINK_WIFI_CHANNEL
+    int "ESP-NOW channel"
+    range 1 13
+    default 1
+
+config DATLINK_STATUS_LED_GPIO
+    int "Status LED GPIO"
+    default 2
+
+config DATLINK_STATUS_LED_ACTIVE_HIGH
+    bool "Status LED is active high"
+    default y
+
+# These remain defined in both roles because ESP-IDF validates and compiles all
+# project components. Only the Probe role calls the SWD component at runtime.
+config DATLINK_SWD_CLK_GPIO
+    int "SWCLK GPIO"
+    default 4
+
+config DATLINK_SWD_IO_GPIO
+    int "SWDIO GPIO"
+    default 5
+
+config DATLINK_SWD_RESET_GPIO
+    int "nRESET GPIO"
+    default 6
+
+config DATLINK_TARGET_VREF_GPIO
+    int "VTref sense GPIO"
+    default 1
+
+config DATLINK_SWD_INITIAL_KHZ
+    int "Initial SWD clock (kHz)"
+    range 50 1000
+    default 100
+
+endmenu

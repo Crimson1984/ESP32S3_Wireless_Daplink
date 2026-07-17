@@ -1,0 +1,24 @@
+请详细分析019f6ec6-f763-7551-b7b2-88dc3b57a506对话(D:\Project\Wireless-UART)的内容,那个项目是对esp8266的无线串口设置,
+需要借鉴cmake/ninjia的本地设置(脱离platformIO),与ESP-now的设置方案.
+
+目前的项目目标是使用esp32s3做一个无线烧录器,主要是给mspm0系列烧录.
+
+使用方式:两个ESP32S3无线连接,一个连接PC,一个连接mspm03507,进行无线烧录,代码端是否要区分主机端与设备端,目前没确定
+
+MSPM0G3507是官方的 launch pad.
+
+代码要求:详细模块化,分类清楚.
+请给出详细的方案与技术细节实现
+
+Chip is ESP32-S3 (QFN56) (revision v0.2)
+Features: Wi-Fi, BT 5 (LE), Dual Core + LP Core, 240MHz, Embedded PSRAM 8MB (AP_3v3)
+Crystal is 40MHz
+MAC: 14c19fcd334c
+Manufacturer: 68
+Device: 4018
+Status value: 0x0200
+Detected flash size: 16MB
+
+每个板子上有两个usb口(UART与OTG)
+
+目前 com8是gatway com7是probe,你可以实时调试或者烧录
