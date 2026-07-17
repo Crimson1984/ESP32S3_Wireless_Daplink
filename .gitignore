@@ -1,0 +1,15 @@
+build/
+managed_components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+generated/
+secrets.local.json
+tools/.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.map
+*.out
+*.bin
+
