@@ -14,11 +14,23 @@ backward compatibility between protocol revisions.
   external downloader and for adding a future GDB server or CMSIS-DAP v2
   debugging backend.
 
+### Fixed
+
+- Kept CLI asynchronous waits alive across individual 2-second serial polling
+  timeouts, so `target-info`, Loader tests and programming results use their
+  full operation deadline instead of reporting a false Gateway timeout.
+- Prevented late, repeatable Probe events from blocking the Gateway ESP-NOW
+  receive base when the PC closes the CDC port between CLI commands.
+- Retained reliable frames after the eight fast retries and switched them to a
+  500 ms recovery interval, avoiding an unrecoverable ordered-sequence gap.
+
 ### Validation pending
 
 - Flash the latest Probe firmware containing the reset-run change and confirm
   that a freshly programmed target starts without pressing the LaunchPad reset
   button.
+- Flash the Gateway and Probe timeout-recovery fixes and complete 50 consecutive
+  `target-info` operations without power-cycling either ESP32-S3.
 - Complete 20 consecutive full-application program/readback/reset cycles.
 - Complete the remaining negative tests for unpowered, protected, malformed,
   interrupted and timeout cases.

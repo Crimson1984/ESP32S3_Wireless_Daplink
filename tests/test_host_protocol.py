@@ -11,9 +11,22 @@ sys.path.insert(0, str(ROOT / "tools" / "datlink_cli"))
 
 from datlink_cli.image import load_image, parse_ihex
 from datlink_cli.cli import decode_target_result
+from datlink_cli.client import DatlinkClient, Progress
 from datlink_cli.protocol import (UsbFrame, cobs_decode, cobs_encode, crc32c,
                                   decode_backup_data, decode_backup_result,
                                   encode_manifest)
+
+
+class FakeSerial:
+    def __init__(self):
+        self.writes: list[bytes] = []
+        self.flushes = 0
+
+    def write(self, data: bytes) -> None:
+        self.writes.append(data)
+
+    def flush(self) -> None:
+        self.flushes += 1
 
 
 class ProtocolTests(unittest.TestCase):
@@ -85,6 +98,62 @@ class ProtocolTests(unittest.TestCase):
         result = decode_backup_result(payload)
         self.assertEqual(result[:4], (operation, 0, 0x20000, digest))
         self.assertEqual(result[4], (0, 0x6BA02477, 0x84770001, 1000))
+
+    def test_request_ignores_one_serial_poll_timeout(self):
+        client = DatlinkClient.__new__(DatlinkClient)
+        client.serial = FakeSerial()
+        client.timeout = 0.2
+        client.request_id = 41
+        client.pending_events = []
+        calls = 0
+
+        def read_frame(_timeout: float) -> UsbFrame:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise TimeoutError("serial receive timeout")
+            return UsbFrame(0x80, 0, client.request_id, struct.pack("<i", 0) + b"ok")
+
+        client._read_frame = read_frame
+        self.assertEqual(client.request(1), b"ok")
+        self.assertEqual(calls, 2)
+        self.assertEqual(client.serial.flushes, 1)
+
+    def test_wait_event_uses_operation_deadline_not_poll_timeout(self):
+        client = DatlinkClient.__new__(DatlinkClient)
+        client.pending_events = []
+        event = UsbFrame(
+            0x81, 0, 0,
+            struct.pack("<iB", 0, 24) + b"target-result")
+        reads = iter((TimeoutError("serial receive timeout"), event))
+
+        def read_frame(_timeout: float) -> UsbFrame:
+            value = next(reads)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        client._read_frame = read_frame
+        self.assertEqual(client.wait_event(24, timeout=0.2), b"target-result")
+
+    def test_wait_result_uses_operation_deadline_not_poll_timeout(self):
+        client = DatlinkClient.__new__(DatlinkClient)
+        client.pending_events = []
+        progress_payload = struct.pack("<iB3xIII", 0, 7, 128, 128, 0)
+        event = UsbFrame(
+            0x81, 0, 0,
+            struct.pack("<iB", 0, 22) + progress_payload)
+        reads = iter((TimeoutError("serial receive timeout"), event))
+
+        def read_frame(_timeout: float) -> UsbFrame:
+            value = next(reads)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        client._read_frame = read_frame
+        self.assertEqual(client.wait_result(timeout=0.2),
+                         Progress(0, 7, 128, 128, 0))
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@
 #define RX_WINDOW 4U
 #define RTO_MS 50U
 #define MAX_RETRIES 8U
+#define RECOVERY_RTO_MS 500U
 #define HEARTBEAT_MS 500U
 #define LINK_TIMEOUT_MS 3000U
 #define TX_QUEUE_LENGTH 32U
@@ -343,19 +344,29 @@ static void tx_task(void *argument)
             bool should_send = false;
             xSemaphoreTake(s_lock, portMAX_DELAY);
             tx_slot_t *slot = &s_tx_slots[i];
-            if (slot->used && (!slot->sent || now - slot->last_sent_ms >= RTO_MS)) {
-                if (slot->retries >= MAX_RETRIES) {
-                    ESP_LOGE(TAG, "sequence %" PRIu32 " exceeded retries", slot->sequence);
-                    memset(slot, 0, sizeof(*slot));
+            const uint64_t retry_interval = slot->retries >= MAX_RETRIES
+                                                ? RECOVERY_RTO_MS
+                                                : RTO_MS;
+            if (slot->used &&
+                (!slot->sent || now - slot->last_sent_ms >= retry_interval)) {
+                if (slot->retries == MAX_RETRIES) {
+                    /* Never discard one frame from an ordered sequence. Doing
+                     * so creates a permanent gap: the peer cannot advance its
+                     * rx_base to any later frame. Enter a slower recovery mode
+                     * and retain the frame until an application ACK arrives. */
+                    ESP_LOGE(TAG, "sequence %" PRIu32
+                                  " exceeded fast retries; retaining for recovery",
+                             slot->sequence);
                     s_link_up = false;
+                    ++slot->retries; /* Log the transition only once. */
                 } else {
-                    frame = slot->frame;
-                    should_send = true;
-                    if (slot->sent) ++s_stats.tx_retries;
-                    slot->sent = true;
-                    slot->last_sent_ms = now;
-                    ++slot->retries;
+                    if (slot->retries < MAX_RETRIES) ++slot->retries;
                 }
+                frame = slot->frame;
+                should_send = true;
+                if (slot->sent) ++s_stats.tx_retries;
+                slot->sent = true;
+                slot->last_sent_ms = now;
             }
             xSemaphoreGive(s_lock);
             if (should_send) {

@@ -78,6 +78,27 @@ class ReliableTransferTests(unittest.TestCase):
         self.assertTrue(accept(0x2222, "HELLO"))
         self.assertFalse(accept(0x1111, "DATA"))
 
+    def test_retry_exhaustion_must_not_create_sequence_gap(self):
+        received: dict[int, bytes] = {}
+        base = 0
+        retained = {1: b"first", 2: b"second"}
+
+        # Simulate an outage longer than the eight fast retries. The sender
+        # keeps sequence 1 for slower recovery instead of deleting it.
+        retries = 0
+        for _ in range(12):
+            retries += 1
+            self.assertIn(1, retained)
+        self.assertGreater(retries, 8)
+        for sequence in (2, 1, 2):
+            received.setdefault(sequence, retained[sequence])
+            while base + 1 in received:
+                base += 1
+
+        self.assertEqual(base, 2)
+        self.assertEqual(b"".join(received[index] for index in range(1, base + 1)),
+                         b"firstsecond")
+
 
 if __name__ == "__main__":
     unittest.main()

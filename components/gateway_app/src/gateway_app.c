@@ -72,6 +72,22 @@ static esp_err_t send_event(uint8_t event_type, const void *payload, size_t leng
     return send_usb(DATLINK_USB_EVENT, 0, DATLINK_OK, event, length + 1U);
 }
 
+static esp_err_t send_best_effort_event(uint8_t event_type,
+                                        const void *payload, size_t length)
+{
+    const esp_err_t err = send_event(event_type, payload, length);
+    if (err != ESP_OK) {
+        /* A CLI process closes the CDC port after every command. A late SWD
+         * result must still be acknowledged on the reliable radio link;
+         * otherwise it permanently occupies rx_base and blocks every later
+         * Probe event until a board reset. The caller can safely issue the
+         * idempotent query again after reconnecting. */
+        ESP_LOGW(TAG, "drop event type=%u while USB is unavailable: %s",
+                 event_type, esp_err_to_name(err));
+    }
+    return ESP_OK;
+}
+
 static void send_progress_event(uint8_t event_type, const datlink_progress_t *progress)
 {
     uint8_t payload[DATLINK_PROGRESS_WIRE_LEN];
@@ -86,14 +102,20 @@ static esp_err_t transport_handler(const datlink_wire_frame_t *frame, void *cont
         frame->type == DATLINK_MSG_PROGRAM_RESULT) {
         if (datlink_progress_decode(frame->payload, frame->payload_length,
                                     &s_progress) == ESP_OK) {
-            return send_event(frame->type, frame->payload, frame->payload_length);
+            return send_best_effort_event(frame->type, frame->payload,
+                                          frame->payload_length);
         }
         return ESP_ERR_INVALID_SIZE;
     }
     if (frame->type == DATLINK_MSG_TARGET_INFO ||
-        frame->type == DATLINK_MSG_LOADER_TEST ||
-        frame->type == DATLINK_MSG_TARGET_BACKUP_DATA ||
+        frame->type == DATLINK_MSG_LOADER_TEST) {
+        return send_best_effort_event(frame->type, frame->payload,
+                                      frame->payload_length);
+    }
+    if (frame->type == DATLINK_MSG_TARGET_BACKUP_DATA ||
         frame->type == DATLINK_MSG_TARGET_BACKUP_RESULT) {
+        /* Backup chunks are not reproducible by a single query, so retain
+         * backpressure until the USB frame has actually been accepted. */
         return send_event(frame->type, frame->payload, frame->payload_length);
     }
     return ESP_ERR_NOT_SUPPORTED;

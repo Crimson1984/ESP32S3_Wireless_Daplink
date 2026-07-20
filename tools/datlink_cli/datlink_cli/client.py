@@ -73,7 +73,7 @@ class DatlinkClient:
                 encoded += value
             else:
                 encoded.clear()
-        raise TimeoutError("gateway did not respond")
+        raise TimeoutError("serial receive timeout")
 
     def request(self, command: int, payload: bytes = b"", timeout: float | None = None) -> bytes:
         self.request_id = (self.request_id + 1) & 0xFFFFFFFF or 1
@@ -82,7 +82,10 @@ class DatlinkClient:
         self.serial.flush()
         deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
         while time.monotonic() < deadline:
-            response = self._read_frame(max(0.01, deadline - time.monotonic()))
+            try:
+                response = self._read_frame(max(0.01, deadline - time.monotonic()))
+            except TimeoutError:
+                continue
             if response.type == protocol.USB_EVENT:
                 status, event = protocol.decode_status_payload(response.payload)
                 if status == 0 and event:
@@ -119,7 +122,13 @@ class DatlinkClient:
             if self.pending_events:
                 event_type, data = self.pending_events.pop(0)
             else:
-                frame = self._read_frame(min(2.0, deadline - time.monotonic()))
+                try:
+                    frame = self._read_frame(min(2.0, deadline - time.monotonic()))
+                except TimeoutError:
+                    # A SWD operation can legitimately take longer than one
+                    # serial read interval. Keep waiting until the operation's
+                    # overall deadline instead of reporting a Gateway failure.
+                    continue
                 if frame.type != protocol.USB_EVENT:
                     continue
                 status, event = protocol.decode_status_payload(frame.payload)
@@ -141,7 +150,12 @@ class DatlinkClient:
                 if event_type == expected_type:
                     self.pending_events.pop(index)
                     return data
-            frame = self._read_frame(min(2.0, deadline - time.monotonic()))
+            try:
+                frame = self._read_frame(min(2.0, deadline - time.monotonic()))
+            except TimeoutError:
+                # The 2-second read is only a polling interval. TARGET_INFO
+                # and loader operations have their own, longer deadline.
+                continue
             if frame.type != protocol.USB_EVENT:
                 continue
             status, event = protocol.decode_status_payload(frame.payload)
