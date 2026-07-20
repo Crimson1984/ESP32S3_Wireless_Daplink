@@ -152,6 +152,7 @@ They do not replace real ESP-NOW, USB, SWD timing or Flash endurance testing.
 
 ## Documentation
 
+- [Changelog](CHANGELOG.md)
 - [Architecture and module ownership](docs/architecture.md)
 - [USB, ESP-NOW and image protocol](docs/protocol.md)
 - [LaunchPad wiring and hardware bring-up](docs/hardware.md)
