@@ -17,12 +17,21 @@ USB_PROGRAM_ABORT = 20
 USB_GET_PROGRESS = 21
 USB_TARGET_RESET = 22
 USB_TARGET_READ_INFO = 23
+USB_LOADER_TEST = 24
+USB_TARGET_BACKUP_START = 25
 USB_RESPONSE = 0x80
 USB_EVENT = 0x81
 
 MSG_PROGRAM_PROGRESS = 21
 MSG_PROGRAM_RESULT = 22
 MSG_TARGET_INFO = 24
+MSG_LOADER_TEST = 25
+MSG_TARGET_BACKUP_DATA = 27
+MSG_TARGET_BACKUP_RESULT = 28
+
+BACKUP_MAIN_SIZE = 0x20000
+BACKUP_DATA_MAX = 180
+BACKUP_RESULT_LEN = 60
 
 
 def crc32c(data: bytes, seed: int = 0) -> int:
@@ -132,3 +141,23 @@ def decode_status_payload(payload: bytes) -> tuple[int, bytes]:
         raise ValueError("response has no status")
     status, = struct.unpack_from("<i", payload)
     return status, payload[4:]
+
+
+def decode_backup_data(payload: bytes) -> tuple[int, int, bytes]:
+    if len(payload) < 10:
+        raise ValueError("short backup data event")
+    operation_id, offset, length = struct.unpack_from("<IIH", payload)
+    if not operation_id or not 1 <= length <= BACKUP_DATA_MAX or len(payload) != 10 + length:
+        raise ValueError("invalid backup data event")
+    return operation_id, offset, payload[10:]
+
+
+def decode_backup_result(
+        payload: bytes) -> tuple[int, int, int, bytes, tuple[int, int, int, int]]:
+    if len(payload) != BACKUP_RESULT_LEN:
+        raise ValueError("invalid backup result event")
+    operation_id, status, total = struct.unpack_from("<IiI", payload)
+    if not operation_id:
+        raise ValueError("backup result has zero operation ID")
+    diagnostic = struct.unpack_from("<4I", payload, 44)
+    return operation_id, status, total, payload[12:44], diagnostic

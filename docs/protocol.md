@@ -18,8 +18,44 @@ response payload begins with signed `status:i32`. An event additionally contains
 `event_type:u8` after status.
 
 Commands are `GET_INFO`, `GET_LINK_STATUS`, `IMAGE_BEGIN`, `IMAGE_DATA`,
-`IMAGE_END`, `PROGRAM_START`, `PROGRAM_ABORT`, `GET_PROGRESS`, `TARGET_RESET`
-and `TARGET_READ_INFO`.
+`IMAGE_END`, `PROGRAM_START`, `PROGRAM_ABORT`, `GET_PROGRESS`, `TARGET_RESET`,
+`TARGET_READ_INFO`, `LOADER_TEST` and `TARGET_BACKUP_START`.
+
+`TARGET_READ_INFO` completes asynchronously with a `TARGET_INFO` event.  Its
+payload starts with a signed little-endian `datlink_status_t`.  On success the
+status is zero and is followed by the 28-byte target information record.  On
+failure it is followed by four `u32` diagnostic fields: stage, DPIDR, AP IDR
+and SWD clock in kHz.  Probe-side VTref and SWD failures are therefore reported
+explicitly and the reliable request is acknowledged rather than retried until
+timeout.
+
+`LOADER_TEST` is a non-destructive preflight operation.  It connects and
+identifies the target, performs the SRAM write/read test, uploads the SRAM
+Flash Loader, executes only its `PROBE` mailbox command, and then issues a
+system reset so the existing target application resumes.  It never invokes a
+Flash erase or program command.  Its asynchronous result uses the same status,
+target-information, and failure-diagnostic layout as `TARGET_READ_INFO`.
+
+`TARGET_BACKUP_START` carries a non-zero `operation_id:u32` and starts a
+read-only 128 KiB MAIN Flash stream. Data events are ordered records:
+
+```text
+operation_id:u32 offset:u32 length:u16 data[length]
+```
+
+`length` is 1..180 bytes. The final 60-byte result is:
+
+```text
+operation_id:u32 status:i32 total_length:u32 sha256:bytes[32]
+stage:u32 dpidr:u32 ap_idr:u32 swd_clock_khz:u32
+```
+
+The Probe keeps one SWD connection for a complete pass, hashes bytes before
+queueing them to the reliable radio transport, then system-resets and
+disconnects the target before emitting the result. The PC validates contiguous
+offsets, the exact 128 KiB length, the Probe digest and its own digest. The CLI
+requires at least two identical complete passes before finalizing a backup
+file. No Flash Loader erase/program command is used.
 
 ## ESP-NOW reliable frame
 

@@ -1,5 +1,6 @@
 #include "datlink_protocol.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 static void put_u16(uint8_t *p, uint16_t value)
@@ -144,7 +145,18 @@ size_t datlink_usb_encode(const datlink_usb_frame_t *frame,
     if (frame == NULL || output == NULL || frame->payload_length > DATLINK_USB_PAYLOAD_MAX) {
         return 0;
     }
-    uint8_t raw[DATLINK_USB_RAW_MAX];
+    /*
+     * Do not put this buffer on the caller's task stack.  The Gateway USB
+     * decoder already owns a DATLINK_USB_ENCODED_MAX receive buffer, and a
+     * response can be encoded from that same task.  Two 4 KiB automatic
+     * buffers overflowed its 8 KiB stack after the first request.
+     *
+     * DATLINK_USB_RAW_MAX is below CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL, so
+     * the project configuration keeps this latency-sensitive buffer in
+     * internal RAM.
+     */
+    uint8_t *raw = malloc(DATLINK_USB_RAW_MAX);
+    if (raw == NULL) return 0;
     raw[0] = DATLINK_PROTOCOL_VERSION;
     raw[1] = frame->type;
     put_u16(raw + 2, frame->flags);
@@ -155,6 +167,7 @@ size_t datlink_usb_encode(const datlink_usb_frame_t *frame,
             datlink_crc32c(0, raw, 12 + frame->payload_length));
     const size_t encoded = datlink_cobs_encode(raw, 16 + frame->payload_length,
                                                output, capacity > 0 ? capacity - 1U : 0U);
+    free(raw);
     if (encoded == 0 || encoded >= capacity) return 0;
     output[encoded] = 0;
     return encoded + 1U;
@@ -166,16 +179,23 @@ esp_err_t datlink_usb_decode(const uint8_t *encoded, size_t encoded_length,
     if (encoded == NULL || frame == NULL || encoded_length == 0U) {
         return ESP_ERR_INVALID_ARG;
     }
-    uint8_t raw[DATLINK_USB_RAW_MAX];
-    const size_t raw_length = datlink_cobs_decode(encoded, encoded_length, raw, sizeof(raw));
+    /* See datlink_usb_encode(): keep the second full-size frame buffer off
+     * the USB decoder task's stack. */
+    uint8_t *raw = malloc(DATLINK_USB_RAW_MAX);
+    if (raw == NULL) return ESP_ERR_NO_MEM;
+    const size_t raw_length = datlink_cobs_decode(encoded, encoded_length, raw,
+                                                  DATLINK_USB_RAW_MAX);
     if (raw_length < 16U || raw[0] != DATLINK_PROTOCOL_VERSION) {
+        free(raw);
         return ESP_ERR_INVALID_RESPONSE;
     }
     const uint32_t payload_length = get_u32(raw + 8);
     if (payload_length > DATLINK_USB_PAYLOAD_MAX || raw_length != 16U + payload_length) {
+        free(raw);
         return ESP_ERR_INVALID_SIZE;
     }
     if (get_u32(raw + 12 + payload_length) != datlink_crc32c(0, raw, 12 + payload_length)) {
+        free(raw);
         return ESP_ERR_INVALID_CRC;
     }
     memset(frame, 0, sizeof(*frame));
@@ -184,6 +204,7 @@ esp_err_t datlink_usb_decode(const uint8_t *encoded, size_t encoded_length,
     frame->request_id = get_u32(raw + 4);
     frame->payload_length = payload_length;
     memcpy(frame->payload, raw + 12, payload_length);
+    free(raw);
     return ESP_OK;
 }
 

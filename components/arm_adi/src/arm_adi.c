@@ -91,6 +91,12 @@ esp_err_t arm_adi_init(void)
 static datlink_status_t connect_at_speed(uint32_t khz, bool under_reset,
                                          arm_adi_info_t *info)
 {
+    s_connected = false;
+    if (info != NULL) {
+        memset(info, 0, sizeof(*info));
+        info->clock_khz = khz;
+        info->stage = ARM_ADI_STAGE_VTREF;
+    }
     swd_phy_set_clock_khz(khz);
     if (swd_phy_enable() != ESP_OK) return DATLINK_ERR_TARGET_POWER;
     swd_phy_assert_reset(under_reset);
@@ -99,19 +105,25 @@ static datlink_status_t connect_at_speed(uint32_t khz, bool under_reset,
     s_selected = UINT32_MAX;
 
     uint32_t dpidr = 0;
+    if (info != NULL) info->stage = ARM_ADI_STAGE_DPIDR;
     datlink_status_t status = arm_adi_read_dp(DP_IDCODE, &dpidr);
+    if (info != NULL) info->dpidr = dpidr;
     if (status != DATLINK_OK || dpidr == 0U || dpidr == UINT32_MAX) {
         swd_phy_safe_state();
         return status == DATLINK_OK ? DATLINK_ERR_TARGET_ID : status;
     }
+    if (info != NULL) info->stage = ARM_ADI_STAGE_ABORT_CLEAR;
     status = arm_adi_write_dp(DP_ABORT, DP_ABORT_CLEAR_ALL);
     if (status != DATLINK_OK) return status;
+    if (info != NULL) info->stage = ARM_ADI_STAGE_DP_SELECT;
     status = arm_adi_write_dp(DP_SELECT, 0);
     if (status != DATLINK_OK) return status;
     s_selected = 0;
+    if (info != NULL) info->stage = ARM_ADI_STAGE_POWER_REQUEST;
     status = arm_adi_write_dp(DP_CTRL_STAT, CTRLSTAT_POWER_REQ);
     if (status != DATLINK_OK) return status;
     uint32_t ctrl = 0;
+    if (info != NULL) info->stage = ARM_ADI_STAGE_POWER_ACK;
     for (unsigned retry = 0; retry < 100U; ++retry) {
         status = arm_adi_read_dp(DP_CTRL_STAT, &ctrl);
         if (status == DATLINK_OK && (ctrl & CTRLSTAT_POWER_ACK) == CTRLSTAT_POWER_ACK) break;
@@ -119,36 +131,80 @@ static datlink_status_t connect_at_speed(uint32_t khz, bool under_reset,
     }
     if ((ctrl & CTRLSTAT_POWER_ACK) != CTRLSTAT_POWER_ACK) return DATLINK_ERR_TIMEOUT;
 
+    /* MSPM0 exposes the SW-DP while nRESET is asserted, but its MEM-AP IDR
+     * reads as zero until the target reset is released.  Complete DP power-up
+     * under reset, then release before selecting and validating the AP. */
+    if (under_reset) {
+        swd_phy_assert_reset(false);
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
     uint32_t ap_idr = 0;
+    if (info != NULL) info->stage = ARM_ADI_STAGE_AP_IDR;
     status = arm_adi_read_ap(AP_IDR, &ap_idr);
+    if (info != NULL) info->ap_idr = ap_idr;
     if (status != DATLINK_OK) return status;
+    if (ap_idr == 0U || ap_idr == UINT32_MAX) return DATLINK_ERR_TARGET_ID;
+    if (info != NULL) info->stage = ARM_ADI_STAGE_AP_CSW;
     status = arm_adi_write_ap(AP_CSW, MEMAP_CSW_32_AUTOINC);
     if (status != DATLINK_OK) return status;
     s_connected = true;
-    if (under_reset) swd_phy_assert_reset(false);
     if (info != NULL) {
         info->dpidr = dpidr;
         info->ap_idr = ap_idr;
         info->clock_khz = khz;
+        info->stage = ARM_ADI_STAGE_NONE;
     }
     return DATLINK_OK;
 }
 
 datlink_status_t arm_adi_connect(bool under_reset, arm_adi_info_t *info)
 {
-    const uint32_t speeds[] = {100U, 1000U, 500U, 250U, 100U};
-    datlink_status_t last = DATLINK_ERR_LINK;
-    for (size_t i = 0; i < sizeof(speeds) / sizeof(speeds[0]); ++i) {
-        last = connect_at_speed(speeds[i], under_reset, info);
-        if (last == DATLINK_OK) {
+    arm_adi_info_t initial = {0};
+    datlink_status_t status = connect_at_speed(100U, under_reset, &initial);
+    if (status != DATLINK_OK) {
+        if (info != NULL) *info = initial;
+        return status;
+    }
+
+    /* Establish the target safely at 100 kHz first, then reconnect without
+     * another hardware reset at the fastest validated rate.  A failed trial
+     * is recovered by a complete lower-speed line reset and DP/AP init. */
+    static const uint32_t promote_speeds[] = {1000U, 500U, 250U};
+    for (size_t i = 0; i < sizeof(promote_speeds) / sizeof(promote_speeds[0]); ++i) {
+        arm_adi_info_t candidate = {0};
+        status = connect_at_speed(promote_speeds[i], false, &candidate);
+        if (status == DATLINK_OK) {
+            if (info != NULL) *info = candidate;
             ESP_LOGI(TAG, "connected DPIDR=0x%08" PRIx32 " APIDR=0x%08" PRIx32
                           " at %" PRIu32 "kHz",
-                     info != NULL ? info->dpidr : 0,
-                     info != NULL ? info->ap_idr : 0, speeds[i]);
+                     candidate.dpidr, candidate.ap_idr, candidate.clock_khz);
             return DATLINK_OK;
         }
+        ESP_LOGW(TAG, "SWD promotion to %" PRIu32 "kHz failed at stage %" PRIu32
+                      ": %s",
+                 promote_speeds[i], candidate.stage, datlink_status_name(status));
     }
-    return last;
+
+    arm_adi_info_t fallback = {0};
+    status = connect_at_speed(100U, false, &fallback);
+    if (info != NULL) *info = fallback;
+    if (status == DATLINK_OK) {
+        ESP_LOGW(TAG, "using validated 100kHz SWD fallback");
+    }
+    return status;
+}
+
+datlink_status_t arm_adi_hardware_reset(void)
+{
+    if (!s_connected || !swd_phy_target_present()) {
+        return DATLINK_ERR_TARGET_POWER;
+    }
+    swd_phy_assert_reset(true);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    swd_phy_assert_reset(false);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    return DATLINK_OK;
 }
 
 void arm_adi_disconnect(void)

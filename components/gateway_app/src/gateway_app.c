@@ -39,43 +39,44 @@ static uint32_t get_u32(const uint8_t *p)
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static void send_usb(uint8_t type, uint32_t request_id, int32_t status,
-                     const void *payload, size_t length)
+static esp_err_t send_usb(uint8_t type, uint32_t request_id, int32_t status,
+                          const void *payload, size_t length)
 {
     datlink_usb_frame_t *response = calloc(1, sizeof(*response));
     if (response == NULL || length + 4U > DATLINK_USB_PAYLOAD_MAX) {
         free(response);
-        return;
+        return response == NULL ? ESP_ERR_NO_MEM : ESP_ERR_INVALID_SIZE;
     }
     response->type = type;
     response->request_id = request_id;
     response->payload_length = (uint32_t)length + 4U;
     put_u32(response->payload, (uint32_t)status);
     if (payload != NULL && length != 0U) memcpy(response->payload + 4, payload, length);
-    (void)gateway_usb_send(response);
+    const esp_err_t err = gateway_usb_send(response);
     free(response);
+    return err;
 }
 
 static void send_response(uint32_t request_id, int32_t status,
                           const void *payload, size_t length)
 {
-    send_usb(DATLINK_USB_RESPONSE, request_id, status, payload, length);
+    (void)send_usb(DATLINK_USB_RESPONSE, request_id, status, payload, length);
 }
 
-static void send_event(uint8_t event_type, const void *payload, size_t length)
+static esp_err_t send_event(uint8_t event_type, const void *payload, size_t length)
 {
     uint8_t event[1 + DATLINK_WIRE_PAYLOAD_MAX];
-    if (length > sizeof(event) - 1U) return;
+    if (length > sizeof(event) - 1U) return ESP_ERR_INVALID_SIZE;
     event[0] = event_type;
     memcpy(event + 1, payload, length);
-    send_usb(DATLINK_USB_EVENT, 0, DATLINK_OK, event, length + 1U);
+    return send_usb(DATLINK_USB_EVENT, 0, DATLINK_OK, event, length + 1U);
 }
 
 static void send_progress_event(uint8_t event_type, const datlink_progress_t *progress)
 {
     uint8_t payload[DATLINK_PROGRESS_WIRE_LEN];
     const size_t length = datlink_progress_encode(progress, payload, sizeof(payload));
-    if (length != 0U) send_event(event_type, payload, length);
+    if (length != 0U) (void)send_event(event_type, payload, length);
 }
 
 static esp_err_t transport_handler(const datlink_wire_frame_t *frame, void *context)
@@ -85,14 +86,15 @@ static esp_err_t transport_handler(const datlink_wire_frame_t *frame, void *cont
         frame->type == DATLINK_MSG_PROGRAM_RESULT) {
         if (datlink_progress_decode(frame->payload, frame->payload_length,
                                     &s_progress) == ESP_OK) {
-            send_event(frame->type, frame->payload, frame->payload_length);
-            return ESP_OK;
+            return send_event(frame->type, frame->payload, frame->payload_length);
         }
         return ESP_ERR_INVALID_SIZE;
     }
-    if (frame->type == DATLINK_MSG_TARGET_INFO) {
-        send_event(frame->type, frame->payload, frame->payload_length);
-        return ESP_OK;
+    if (frame->type == DATLINK_MSG_TARGET_INFO ||
+        frame->type == DATLINK_MSG_LOADER_TEST ||
+        frame->type == DATLINK_MSG_TARGET_BACKUP_DATA ||
+        frame->type == DATLINK_MSG_TARGET_BACKUP_RESULT) {
+        return send_event(frame->type, frame->payload, frame->payload_length);
     }
     return ESP_ERR_NOT_SUPPORTED;
 }
@@ -219,6 +221,19 @@ static void usb_handler(const datlink_usb_frame_t *frame, void *context)
     case DATLINK_USB_TARGET_READ_INFO:
         err = datlink_transport_send(DATLINK_MSG_TARGET_INFO, 0, NULL, 0,
                                      pdMS_TO_TICKS(100));
+        break;
+    case DATLINK_USB_LOADER_TEST:
+        err = datlink_transport_send(DATLINK_MSG_LOADER_TEST, 0, NULL, 0,
+                                     pdMS_TO_TICKS(100));
+        break;
+    case DATLINK_USB_TARGET_BACKUP_START:
+        if (frame->payload_length != 4U || !datlink_transport_link_up()) {
+            err = ESP_ERR_INVALID_STATE;
+        } else {
+            err = datlink_transport_send(DATLINK_MSG_TARGET_BACKUP_START, 0,
+                                         frame->payload, frame->payload_length,
+                                         pdMS_TO_TICKS(100));
+        }
         break;
     default:
         err = ESP_ERR_NOT_SUPPORTED;

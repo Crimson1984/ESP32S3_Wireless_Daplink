@@ -103,9 +103,22 @@ esp_err_t gateway_usb_send(const datlink_usb_frame_t *frame)
     if (frame == NULL) return ESP_ERR_INVALID_ARG;
     xSemaphoreTake(s_tx_lock, portMAX_DELAY);
     const size_t length = datlink_usb_encode(frame, s_tx_buffer, sizeof(s_tx_buffer));
-    esp_err_t err = length == 0U ? ESP_ERR_INVALID_SIZE :
-                    tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0, s_tx_buffer, length);
-    if (err == ESP_OK) err = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0, 100);
+    esp_err_t err = ESP_OK;
+    if (length == 0U) {
+        err = ESP_ERR_INVALID_SIZE;
+    } else {
+        /* tinyusb_cdcacm_write_queue() returns a byte count, not esp_err_t.
+         * Treating a successful non-zero count as an error skipped flushes
+         * and left short binary responses (notably link/progress) queued. */
+        const size_t written = tinyusb_cdcacm_write_queue(TINYUSB_CDC_ACM_0,
+                                                          s_tx_buffer, length);
+        if (written != length) {
+            err = ESP_ERR_NO_MEM;
+        } else {
+            err = tinyusb_cdcacm_write_flush(TINYUSB_CDC_ACM_0,
+                                             pdMS_TO_TICKS(100));
+        }
+    }
     xSemaphoreGive(s_tx_lock);
     return err;
 }

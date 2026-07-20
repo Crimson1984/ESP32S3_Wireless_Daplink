@@ -32,19 +32,19 @@ static inline void IRAM_ATTR set_clk(int level)
 static inline void IRAM_ATTR clock_out_bit(uint32_t bit)
 {
     gpio_set_level(SWDIO_GPIO, (int)(bit & 1U));
+    set_clk(0);
     delay_half_cycle();
     set_clk(1);
     delay_half_cycle();
-    set_clk(0);
 }
 
 static inline uint32_t IRAM_ATTR clock_in_bit(void)
 {
-    delay_half_cycle();
-    set_clk(1);
+    set_clk(0);
     delay_half_cycle();
     const uint32_t bit = (uint32_t)gpio_get_level(SWDIO_GPIO);
-    set_clk(0);
+    set_clk(1);
+    delay_half_cycle();
     return bit;
 }
 
@@ -134,7 +134,9 @@ esp_err_t swd_phy_enable(void)
     swdio_output();
     gpio_set_level(SWDIO_GPIO, 1);
     gpio_set_level(RESET_GPIO, 1);
-    set_clk(0);
+    /* Match the CMSIS-DAP SWD bit-bang convention: every bit ends with
+     * SWCLK high; input data is sampled during the preceding low phase. */
+    set_clk(1);
     s_enabled = true;
     return ESP_OK;
 }
@@ -173,11 +175,13 @@ datlink_status_t swd_phy_transfer(bool ap, bool read, uint8_t address,
     (void)clock_in_bit();
     const uint32_t ack = read_bits(3);
     if (ack != SWD_ACK_OK) {
-        swdio_input();
-        for (unsigned i = 0; i < 33; ++i) (void)clock_in_bit();
+        /* CMSIS-DAP's default SWD configuration has data_phase disabled.
+         * WAIT/FAULT therefore goes directly through the target-to-host
+         * turnaround; clocking a dummy 32-bit data word here desynchronizes
+         * the next request. */
+        (void)clock_in_bit();
         swdio_output();
         gpio_set_level(SWDIO_GPIO, 1);
-        clock_out_bit(1);
         return ack == SWD_ACK_WAIT ? DATLINK_ERR_SWD_ACK_WAIT
              : ack == SWD_ACK_FAULT ? DATLINK_ERR_SWD_ACK_FAULT
                                     : DATLINK_ERR_LINK;
@@ -188,8 +192,9 @@ datlink_status_t swd_phy_transfer(bool ap, bool read, uint8_t address,
         const uint32_t received_parity = read_bits(1);
         (void)clock_in_bit();
         swdio_output();
+        /* Return SWDIO high without clocking it.  A clocked high bit is a
+         * Start bit, not an idle cycle, and shifts the following request. */
         gpio_set_level(SWDIO_GPIO, 1);
-        clock_out_bit(1);
         if (((uint32_t)__builtin_parity(value)) != received_parity) {
             return DATLINK_ERR_SWD_PARITY;
         }
@@ -199,8 +204,9 @@ datlink_status_t swd_phy_transfer(bool ap, bool read, uint8_t address,
         swdio_output();
         write_bits(*data, 32);
         clock_out_bit((uint32_t)__builtin_parity(*data));
+        /* Idle cycles, when requested, must be clocked with SWDIO low.  This
+         * implementation uses zero idle cycles between transfers. */
         gpio_set_level(SWDIO_GPIO, 1);
-        clock_out_bit(1);
     }
     return DATLINK_OK;
 }

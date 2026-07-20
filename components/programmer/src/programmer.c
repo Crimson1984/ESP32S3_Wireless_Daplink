@@ -16,6 +16,12 @@
 #define PROGRAMMER_TASK_STACK 8192U
 #define LOADER_TIMEOUT_MS 3000U
 
+typedef enum {
+    PROGRAMMER_TASK_NONE = 0,
+    PROGRAMMER_TASK_FLASH,
+    PROGRAMMER_TASK_BACKUP,
+} programmer_task_kind_t;
+
 static SemaphoreHandle_t s_lock;
 static TaskHandle_t s_task;
 static programmer_progress_cb_t s_callback;
@@ -23,6 +29,10 @@ static void *s_callback_context;
 static datlink_progress_t s_progress;
 static uint32_t s_operation_id;
 static atomic_bool s_abort;
+static programmer_task_kind_t s_task_kind;
+static programmer_backup_data_cb_t s_backup_data_callback;
+static programmer_backup_done_cb_t s_backup_done_callback;
+static void *s_backup_context;
 
 static esp_err_t status_to_esp(datlink_status_t status)
 {
@@ -46,16 +56,33 @@ static void report(programmer_phase_t phase, datlink_status_t status,
     if (s_callback != NULL) s_callback(&copy, s_callback_context);
 }
 
-static datlink_status_t connect_target(mspm0g3507_info_t *target)
+static datlink_status_t connect_target(mspm0g3507_info_t *target,
+                                       programmer_target_diagnostic_t *diagnostic)
 {
+    memset(target, 0, sizeof(*target));
+    if (diagnostic != NULL) memset(diagnostic, 0, sizeof(*diagnostic));
     report(PROGRAMMER_PHASE_CONNECT, DATLINK_OK, 0, 0, 0);
     datlink_status_t status = arm_adi_connect(true, &target->adi);
-    if (status == DATLINK_OK) status = cortexm_halt(500U);
+    if (diagnostic != NULL) {
+        diagnostic->stage = target->adi.stage;
+        diagnostic->dpidr = target->adi.dpidr;
+        diagnostic->ap_idr = target->adi.ap_idr;
+        diagnostic->swd_clock_khz = target->adi.clock_khz;
+    }
+    if (status == DATLINK_OK) {
+        if (diagnostic != NULL) diagnostic->stage = ARM_ADI_STAGE_HALT;
+        status = cortexm_halt(500U);
+    }
     if (status == DATLINK_OK) {
         report(PROGRAMMER_PHASE_IDENTIFY, DATLINK_OK, 0, 0, 0);
+        if (diagnostic != NULL) diagnostic->stage = ARM_ADI_STAGE_IDENTIFY;
         status = mspm0g3507_identify(target);
     }
-    if (status == DATLINK_OK) status = mspm0g3507_sram_self_test();
+    if (status == DATLINK_OK) {
+        if (diagnostic != NULL) diagnostic->stage = ARM_ADI_STAGE_SRAM_TEST;
+        status = mspm0g3507_sram_self_test();
+    }
+    if (status == DATLINK_OK && diagnostic != NULL) diagnostic->stage = ARM_ADI_STAGE_NONE;
     return status;
 }
 
@@ -171,7 +198,7 @@ static void programmer_task(void *arg)
     const datlink_image_manifest_t manifest = *datlink_storage_manifest();
     datlink_status_t status = mspm0g3507_validate_manifest(&manifest);
     mspm0g3507_info_t target;
-    if (status == DATLINK_OK) status = connect_target(&target);
+    if (status == DATLINK_OK) status = connect_target(&target, NULL);
     if (status == DATLINK_OK) {
         report(PROGRAMMER_PHASE_LOADER, DATLINK_OK, 0, 0, 0);
         status = mspm0_loader_upload();
@@ -202,6 +229,85 @@ static void programmer_task(void *arg)
     arm_adi_disconnect();
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_task = NULL;
+    s_task_kind = PROGRAMMER_TASK_NONE;
+    xSemaphoreGive(s_lock);
+    vTaskDelete(NULL);
+}
+
+static void backup_task(void *arg)
+{
+    (void)arg;
+    uint8_t data[DATLINK_BACKUP_DATA_BYTES];
+    uint8_t digest[DATLINK_SHA256_LEN] = {0};
+    programmer_target_diagnostic_t diagnostic = {0};
+    mspm0g3507_info_t target;
+    uint32_t completed = 0;
+    bool connected = false;
+
+    datlink_status_t status = connect_target(&target, &diagnostic);
+    if (status == DATLINK_OK) connected = true;
+
+    psa_hash_operation_t sha = PSA_HASH_OPERATION_INIT;
+    bool hash_started = false;
+    if (status == DATLINK_OK) {
+        if (psa_crypto_init() != PSA_SUCCESS ||
+            psa_hash_setup(&sha, PSA_ALG_SHA_256) != PSA_SUCCESS) {
+            status = DATLINK_ERR_VERIFY;
+        } else {
+            hash_started = true;
+            diagnostic.stage = ARM_ADI_STAGE_FLASH_READ;
+        }
+    }
+
+    while (status == DATLINK_OK && completed < MSPM0G3507_FLASH_SIZE) {
+        if (atomic_load(&s_abort)) {
+            status = DATLINK_ERR_ABORTED;
+            break;
+        }
+        size_t count = MSPM0G3507_FLASH_SIZE - completed;
+        if (count > sizeof(data)) count = sizeof(data);
+        status = arm_adi_mem_read(MSPM0G3507_FLASH_BASE + completed, data, count);
+        if (status != DATLINK_OK) break;
+        if (psa_hash_update(&sha, data, count) != PSA_SUCCESS) {
+            status = DATLINK_ERR_VERIFY;
+            break;
+        }
+        if (s_backup_data_callback == NULL ||
+            s_backup_data_callback(s_operation_id, completed, data, count,
+                                   s_backup_context) != ESP_OK) {
+            status = DATLINK_ERR_LINK;
+            break;
+        }
+        completed += (uint32_t)count;
+    }
+
+    if (status == DATLINK_OK) {
+        size_t digest_length = 0;
+        if (psa_hash_finish(&sha, digest, sizeof(digest), &digest_length) != PSA_SUCCESS ||
+            digest_length != sizeof(digest)) {
+            status = DATLINK_ERR_VERIFY;
+        }
+        hash_started = false;
+    }
+    if (hash_started) (void)psa_hash_abort(&sha);
+
+    if (connected) {
+        diagnostic.stage = ARM_ADI_STAGE_RESET;
+        const datlink_status_t reset_status = cortexm_system_reset(false);
+        if (status == DATLINK_OK && reset_status != DATLINK_OK) status = reset_status;
+    }
+    /* A partially failed connect may still have driven SWD/nRESET. Always
+     * release the external pins even when no valid DP/AP session was formed. */
+    arm_adi_disconnect();
+    if (status == DATLINK_OK) diagnostic.stage = ARM_ADI_STAGE_NONE;
+
+    if (s_backup_done_callback != NULL) {
+        s_backup_done_callback(s_operation_id, status, completed, digest,
+                               &diagnostic, s_backup_context);
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_task = NULL;
+    s_task_kind = PROGRAMMER_TASK_NONE;
     xSemaphoreGive(s_lock);
     vTaskDelete(NULL);
 }
@@ -225,7 +331,8 @@ esp_err_t programmer_start(uint32_t operation_id)
     if (!datlink_storage_ready() || operation_id == 0U) return ESP_ERR_INVALID_STATE;
     xSemaphoreTake(s_lock, portMAX_DELAY);
     if (s_task != NULL) {
-        bool same = s_operation_id == operation_id;
+        bool same = s_task_kind == PROGRAMMER_TASK_FLASH &&
+                    s_operation_id == operation_id;
         xSemaphoreGive(s_lock);
         return same ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
@@ -235,11 +342,13 @@ esp_err_t programmer_start(uint32_t operation_id)
         return ESP_OK;
     }
     s_operation_id = operation_id;
+    s_task_kind = PROGRAMMER_TASK_FLASH;
     atomic_store(&s_abort, false);
     BaseType_t created = xTaskCreatePinnedToCore(programmer_task, "programmer",
                                                  PROGRAMMER_TASK_STACK, NULL, 8,
                                                  &s_task, 1);
     xSemaphoreGive(s_lock);
+    if (created != pdPASS) s_task_kind = PROGRAMMER_TASK_NONE;
     return created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
@@ -254,11 +363,13 @@ esp_err_t programmer_get_progress(datlink_progress_t *progress)
     return ESP_OK;
 }
 
-esp_err_t programmer_read_target_info(programmer_target_info_t *info)
+datlink_status_t programmer_read_target_info(
+    programmer_target_info_t *info, programmer_target_diagnostic_t *diagnostic)
 {
-    if (info == NULL || s_task != NULL) return ESP_ERR_INVALID_STATE;
+    if (info == NULL) return DATLINK_ERR_ARGUMENT;
+    if (s_task != NULL) return DATLINK_ERR_STATE;
     mspm0g3507_info_t target;
-    datlink_status_t status = connect_target(&target);
+    datlink_status_t status = connect_target(&target, diagnostic);
     if (status == DATLINK_OK) {
         *info = (programmer_target_info_t){
             .dpidr = target.adi.dpidr, .ap_idr = target.adi.ap_idr,
@@ -267,9 +378,70 @@ esp_err_t programmer_read_target_info(programmer_target_info_t *info)
             .factory_sramflash = target.factory_sramflash,
             .swd_clock_khz = target.adi.clock_khz,
         };
+        if (diagnostic != NULL) diagnostic->stage = ARM_ADI_STAGE_RESET;
+        status = cortexm_system_reset(false);
     }
     arm_adi_disconnect();
-    return status_to_esp(status);
+    return status;
+}
+
+datlink_status_t programmer_test_loader(
+    programmer_target_info_t *info, programmer_target_diagnostic_t *diagnostic)
+{
+    if (info == NULL) return DATLINK_ERR_ARGUMENT;
+    if (s_task != NULL) return DATLINK_ERR_STATE;
+
+    mspm0g3507_info_t target;
+    datlink_status_t status = connect_target(&target, diagnostic);
+    if (status == DATLINK_OK) {
+        *info = (programmer_target_info_t){
+            .dpidr = target.adi.dpidr, .ap_idr = target.adi.ap_idr,
+            .cpuid = target.cpuid, .factory_device_id = target.factory_device_id,
+            .factory_user_id = target.factory_user_id,
+            .factory_sramflash = target.factory_sramflash,
+            .swd_clock_khz = target.adi.clock_khz,
+        };
+        if (diagnostic != NULL) diagnostic->stage = ARM_ADI_STAGE_LOADER_UPLOAD;
+        status = mspm0_loader_upload();
+    }
+    if (status == DATLINK_OK) {
+        mspm0_loader_mailbox_t mailbox = {.command = MSPM0_LOADER_CMD_PROBE};
+        if (diagnostic != NULL) diagnostic->stage = ARM_ADI_STAGE_LOADER_EXECUTE;
+        status = mspm0_loader_execute(&mailbox, NULL, 0, LOADER_TIMEOUT_MS);
+    }
+    if (status == DATLINK_OK) {
+        if (diagnostic != NULL) diagnostic->stage = ARM_ADI_STAGE_RESET;
+        status = cortexm_system_reset(false);
+    }
+    if (status == DATLINK_OK && diagnostic != NULL) diagnostic->stage = ARM_ADI_STAGE_NONE;
+    arm_adi_disconnect();
+    return status;
+}
+
+esp_err_t programmer_backup_start(uint32_t operation_id,
+                                  programmer_backup_data_cb_t data_callback,
+                                  programmer_backup_done_cb_t done_callback,
+                                  void *context)
+{
+    if (operation_id == 0U || data_callback == NULL || done_callback == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_task != NULL) {
+        xSemaphoreGive(s_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_operation_id = operation_id;
+    s_backup_data_callback = data_callback;
+    s_backup_done_callback = done_callback;
+    s_backup_context = context;
+    s_task_kind = PROGRAMMER_TASK_BACKUP;
+    atomic_store(&s_abort, false);
+    const BaseType_t created = xTaskCreatePinnedToCore(
+        backup_task, "target_backup", PROGRAMMER_TASK_STACK, NULL, 8, &s_task, 1);
+    if (created != pdPASS) s_task_kind = PROGRAMMER_TASK_NONE;
+    xSemaphoreGive(s_lock);
+    return created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 esp_err_t programmer_reset_target(void)

@@ -116,6 +116,8 @@ Use the Gateway native OTG CDC COM port, not CH343 COM8:
 datlink --port COMx info
 datlink --port COMx link
 datlink --port COMx target-info
+datlink --port COMx loader-test
+datlink --port COMx backup backups\mspm0g3507-main.bin
 datlink --port COMx program app.out
 datlink --port COMx program app.elf
 datlink --port COMx program app.hex
@@ -128,6 +130,11 @@ datlink --port COMx abort
 ELF/TI `.out` must be ELF32 little-endian. The host selects loadable MAIN-Flash
 segments; BIN requires an explicit base. Segment starts must be 64-bit aligned,
 matching the MSPM0 Flash programming unit.
+
+`backup` is read-only. It reads the complete 128 KiB MAIN Flash twice by
+default, compares every byte and both SHA-256 digests, and only then finalizes
+the requested output file. Existing files are not replaced unless `--force`
+is supplied. The Probe issues a system reset after every pass.
 
 ## Verification
 

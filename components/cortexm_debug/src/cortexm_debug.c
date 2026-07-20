@@ -1,6 +1,7 @@
 #include "cortexm_debug.h"
 
 #include "arm_adi.h"
+#include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -18,6 +19,8 @@
 #define REGWnR       (1U << 16)
 #define VECTKEY      0x05FA0000U
 #define SYSRESETREQ  (1U << 2)
+
+static const char *TAG = "cortexm_debug";
 
 static datlink_status_t wait_dhcsr(uint32_t mask, bool set, uint32_t timeout_ms)
 {
@@ -69,7 +72,24 @@ datlink_status_t cortexm_system_reset(bool halt_after_reset)
     datlink_status_t status = arm_adi_mem_write32(AIRCR, VECTKEY | SYSRESETREQ);
     if (status != DATLINK_OK) return status;
     vTaskDelay(pdMS_TO_TICKS(20));
-    return halt_after_reset ? cortexm_halt(500U) : DATLINK_OK;
+    if (halt_after_reset) return cortexm_halt(500U);
+
+    /* The SRAM loader terminates with BKPT. SYSRESETREQ resets the core but
+     * does not guarantee that the external debug halt request is cleared.
+     * Explicitly resume and prove that S_HALT is deasserted before reporting
+     * a successful reset-run operation. */
+    status = cortexm_run();
+    if (status == DATLINK_OK) status = wait_dhcsr(S_HALT, false, 500U);
+    if (status == DATLINK_OK) return DATLINK_OK;
+
+    /* A physical nRESET pulse is the bounded fallback. Keep the SWD session
+     * active, clear C_HALT again after reset, and still require a positive
+     * running-state check. */
+    ESP_LOGW(TAG, "software reset did not leave the core running: %s; pulsing nRESET",
+             datlink_status_name(status));
+    status = arm_adi_hardware_reset();
+    if (status == DATLINK_OK) status = cortexm_run();
+    return status == DATLINK_OK ? wait_dhcsr(S_HALT, false, 500U) : status;
 }
 
 datlink_status_t cortexm_read_cpuid(uint32_t *cpuid)

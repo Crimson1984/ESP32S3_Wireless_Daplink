@@ -10,7 +10,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools" / "datlink_cli"))
 
 from datlink_cli.image import load_image, parse_ihex
+from datlink_cli.cli import decode_target_result
 from datlink_cli.protocol import (UsbFrame, cobs_decode, cobs_encode, crc32c,
+                                  decode_backup_data, decode_backup_result,
                                   encode_manifest)
 
 
@@ -57,6 +59,32 @@ class ProtocolTests(unittest.TestCase):
             bin_path = Path(directory) / "test.bin"
             bin_path.write_bytes(b"\x11\x22")
             self.assertEqual(load_image(str(bin_path), 0x80), [(0x80, b"\x11\x22")])
+
+    def test_target_operation_result(self):
+        values = (0x6BA02477, 0x84770001, 0x410CC601, 0x2BB8802F,
+                  0x80C7AE2D, 0x00200080, 1000)
+        result = decode_target_result(struct.pack("<i7I", 0, *values), "loader")
+        self.assertEqual(result["dpidr"], "0x6ba02477")
+        self.assertEqual(result["swd_clock_khz"], 1000)
+
+        failure = struct.pack("<i4I", -14, 14, values[0], values[1], 1000)
+        with self.assertRaisesRegex(RuntimeError, "loader_execute"):
+            decode_target_result(failure, "loader")
+
+    def test_backup_event_layouts(self):
+        operation = 0x12345678
+        chunk = bytes(range(180))
+        decoded = decode_backup_data(struct.pack("<IIH", operation, 0x240, len(chunk)) + chunk)
+        self.assertEqual(decoded, (operation, 0x240, chunk))
+        with self.assertRaises(ValueError):
+            decode_backup_data(struct.pack("<IIH", operation, 0, 181) + bytes(181))
+
+        digest = hashlib.sha256(b"backup").digest()
+        payload = (struct.pack("<IiI", operation, 0, 0x20000) + digest +
+                   struct.pack("<4I", 0, 0x6BA02477, 0x84770001, 1000))
+        result = decode_backup_result(payload)
+        self.assertEqual(result[:4], (operation, 0, 0x20000, digest))
+        self.assertEqual(result[4], (0, 0x6BA02477, 0x84770001, 1000))
 
 
 if __name__ == "__main__":

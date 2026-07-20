@@ -1,15 +1,20 @@
 build/
+backups/
 managed_components/
 dependencies.lock
 sdkconfig
 sdkconfig.old
 generated/
 secrets.local.json
-tools/.venv/
+.venv/
+*.egg-info/
 __pycache__/
 .pytest_cache/
 *.pyc
+*.log
 *.map
 *.out
 *.bin
 
+# Local CCS debug-server trace accidentally produced by command redirection.
+/true

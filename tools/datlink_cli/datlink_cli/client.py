@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import secrets
 import struct
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from . import protocol
 
@@ -24,6 +27,13 @@ class Progress:
         return cls(status, phase, completed, total, detail)
 
 
+@dataclass(frozen=True)
+class BackupResult:
+    data: bytes
+    sha256: bytes
+    swd_clock_khz: int
+
+
 class DatlinkClient:
     def __init__(self, port: str, baudrate: int = 115200, timeout: float = 3.0):
         try:
@@ -32,8 +42,12 @@ class DatlinkClient:
             raise RuntimeError("pyserial is required: python -m pip install pyserial") from error
         self.serial = serial.Serial(port, baudrate=baudrate, timeout=0.1,
                                     write_timeout=timeout)
+        # usbser.sys may retain a completed response across close/open cycles.
+        # Drop stale input and start from a non-repeating request ID so an old
+        # frame cannot be mistaken for the first request of a new CLI process.
+        self.serial.reset_input_buffer()
         self.timeout = timeout
-        self.request_id = 0
+        self.request_id = secrets.randbits(32)
         self.pending_events: list[tuple[int, bytes]] = []
 
     def close(self) -> None:
@@ -136,3 +150,68 @@ class DatlinkClient:
                     return event[1:]
                 self.pending_events.append((event[0], event[1:]))
         raise TimeoutError(f"event {expected_type} did not arrive")
+
+    def backup_main(self, operation_id: int, timeout: float = 180.0,
+                    progress: Callable[[int, int], None] | None = None) -> BackupResult:
+        if not operation_id:
+            raise ValueError("backup operation ID must be non-zero")
+        self.request(protocol.USB_TARGET_BACKUP_START,
+                     struct.pack("<I", operation_id), 5.0)
+        deadline = time.monotonic() + timeout
+        image = bytearray()
+        while time.monotonic() < deadline:
+            if self.pending_events:
+                event_type, payload = self.pending_events.pop(0)
+            else:
+                try:
+                    frame = self._read_frame(min(2.0, deadline - time.monotonic()))
+                except TimeoutError:
+                    continue
+                if frame.type != protocol.USB_EVENT:
+                    continue
+                status, event = protocol.decode_status_payload(frame.payload)
+                if status != 0 or not event:
+                    continue
+                event_type, payload = event[0], event[1:]
+
+            if event_type == protocol.MSG_TARGET_BACKUP_DATA:
+                received_operation, offset, data = protocol.decode_backup_data(payload)
+                if received_operation != operation_id:
+                    continue
+                if offset < len(image):
+                    end = offset + len(data)
+                    if end <= len(image) and image[offset:end] == data:
+                        # A USB flush may report failure after bytes reached
+                        # usbser.sys. The reliable radio layer then repeats the
+                        # event; accept only an exact duplicate.
+                        continue
+                    raise ValueError(f"conflicting duplicate backup data at {offset:#x}")
+                if offset != len(image) or len(image) + len(data) > protocol.BACKUP_MAIN_SIZE:
+                    raise ValueError(
+                        f"backup data is not contiguous: expected {len(image):#x}, got {offset:#x}")
+                image.extend(data)
+                if progress is not None:
+                    progress(len(image), protocol.BACKUP_MAIN_SIZE)
+                continue
+
+            if event_type != protocol.MSG_TARGET_BACKUP_RESULT:
+                continue
+            received_operation, status, total, remote_sha, diagnostic = \
+                protocol.decode_backup_result(payload)
+            if received_operation != operation_id:
+                continue
+            stage, dpidr, ap_idr, clock = diagnostic
+            if status != 0:
+                raise RuntimeError(
+                    f"target backup failed: status={status}, stage={stage},"
+                    f" swd={clock}kHz, dpidr=0x{dpidr:08x}, ap_idr=0x{ap_idr:08x},"
+                    f" received={total}")
+            if total != protocol.BACKUP_MAIN_SIZE or len(image) != total:
+                raise ValueError(
+                    f"backup length mismatch: event={total}, received={len(image)}")
+            local_sha = hashlib.sha256(image).digest()
+            if local_sha != remote_sha:
+                raise ValueError(
+                    f"backup SHA-256 mismatch: probe={remote_sha.hex()}, host={local_sha.hex()}")
+            return BackupResult(bytes(image), local_sha, clock)
+        raise TimeoutError("target backup did not finish")

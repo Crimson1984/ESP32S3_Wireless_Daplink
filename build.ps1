@@ -119,20 +119,20 @@ foreach ($CurrentRole in $Roles) {
     $env:DATLINK_ROLE_NAME = $roleName
     $idf = Join-Path $IdfPath 'tools\idf.py'
     Invoke-Checked "Build $CurrentRole" {
-        & python $idf -B $buildDir "-DSDKCONFIG=$sdkconfigPath" "-DSDKCONFIG_DEFAULTS=$defaults" build
+        & $PythonEnv $idf -B $buildDir "-DSDKCONFIG=$sdkconfigPath" "-DSDKCONFIG_DEFAULTS=$defaults" build
     }
 
     if ($Flash) {
         $flashPort = if ($Port) { $Port } elseif ($roleName -eq 'gateway') { 'COM8' } else { 'COM7' }
         Invoke-Checked "Flash $CurrentRole on $flashPort" {
-            & python $idf -B $buildDir -p $flashPort -b $Baud flash
+            & $PythonEnv $idf -B $buildDir -p $flashPort -b $Baud flash
         }
     }
 
     if ($Monitor) {
         $monitorPort = if ($Port) { $Port } elseif ($roleName -eq 'gateway') { 'COM8' } else { 'COM7' }
         Invoke-Checked "Monitor $CurrentRole on $monitorPort" {
-            & python $idf -B $buildDir -p $monitorPort monitor
+            & $PythonEnv $idf -B $buildDir -p $monitorPort monitor
         }
     }
 }
