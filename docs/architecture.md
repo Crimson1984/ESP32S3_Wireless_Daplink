@@ -16,7 +16,8 @@ flowchart LR
 The role is selected by Kconfig at compile time. USB presence is never used to
 guess a role. Wi-Fi/radio receive runs on Core 0; the ESP-NOW TX worker and SWD
 programmer task are pinned to Core 1. ESP-NOW callbacks only copy fixed-size
-records into queues.
+records into queues. Gateway and Probe application workers are separate from
+the radio RX task, so USB, storage and SWD work cannot block frame reception.
 
 ## Components
 
@@ -26,7 +27,7 @@ records into queues.
 | `protocol` | explicit little-endian USB/wire/manifest/progress encoding, COBS |
 | `security` | fixed MAC validation, PMK/LMK access, peer whitelist |
 | `storage` | image and metadata partitions, sequential staging, SHA validation |
-| `transport_espnow` | peer setup, session, window, ACK bitmap, retry, heartbeat |
+| `transport_espnow` | peer setup, committed ACKs, async RX tokens, retry, epoch recovery |
 | `gateway_usb` | TinyUSB CDC receive queue, frame decoder and serialized transmit |
 | `gateway_app` | PC commands, Gateway staging, image forwarding, event aggregation |
 | `swd_phy` | VTref gate, GPIO timing, request/ACK/parity and safe state |
@@ -35,7 +36,7 @@ records into queues.
 | `mspm0g3507` | MAIN/SRAM layout, CPUID/Factory Region checks, SRAM self-test |
 | `mspm0_loader` | upload, mailbox command execution and result validation |
 | `programmer` | Core-1 erase/program/readback/reset state machine |
-| `probe_app` | reliable-message dispatch and serialized status responses |
+| `probe_app` | queued application worker, serialized SWD/storage work and status responses |
 | `diagnostics` | UART identity/capacity logs and activity LED |
 
 ## Programmer phases

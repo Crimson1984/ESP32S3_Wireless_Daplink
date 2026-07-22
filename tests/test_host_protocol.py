@@ -9,9 +9,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools" / "datlink_cli"))
 
+from datlink_cli import protocol
 from datlink_cli.image import load_image, parse_ihex
 from datlink_cli.cli import decode_target_result
-from datlink_cli.client import DatlinkClient, Progress
+from datlink_cli.client import DatlinkClient, Progress, RemoteCommandError
 from datlink_cli.protocol import (UsbFrame, cobs_decode, cobs_encode, crc32c,
                                   decode_backup_data, decode_backup_result,
                                   encode_manifest)
@@ -46,6 +47,20 @@ class ProtocolTests(unittest.TestCase):
         corrupt[-1] ^= 1
         with self.assertRaises(ValueError):
             UsbFrame.decode(bytes(corrupt))
+
+    def test_protocol_v1_is_rejected_with_actionable_error(self):
+        raw = struct.pack("<BBHII", 1, 1, 0, 7, 0)
+        encoded = cobs_encode(raw + struct.pack("<I", crc32c(raw)))
+        with self.assertRaisesRegex(ValueError, "protocol version mismatch"):
+            UsbFrame.decode(encoded)
+
+    def test_command_error_layout(self):
+        payload = struct.pack("<IIB3xiI", 0x11223344, 17, 24, -2, 0x55AA)
+        self.assertEqual(
+            protocol.decode_command_error(payload),
+            (0x11223344, 17, 24, -2, 0x55AA))
+        with self.assertRaises(ValueError):
+            protocol.decode_command_error(payload[:-1])
 
     def test_manifest_layout(self):
         operation = 0x12345678
@@ -135,6 +150,28 @@ class ProtocolTests(unittest.TestCase):
 
         client._read_frame = read_frame
         self.assertEqual(client.wait_event(24, timeout=0.2), b"target-result")
+
+    def test_wait_event_surfaces_remote_command_error(self):
+        client = DatlinkClient.__new__(DatlinkClient)
+        payload = struct.pack("<IIB3xiI", 0x1234, 8, 24, -2, 0x99)
+        client.pending_events = [(protocol.MSG_COMMAND_ERROR, payload)]
+        with self.assertRaisesRegex(RemoteCommandError, "rejected message 24"):
+            client.wait_event(protocol.MSG_TARGET_INFO, timeout=0.2)
+
+    def test_link_status_v2_layout(self):
+        client = DatlinkClient.__new__(DatlinkClient)
+        payload = bytearray(40)
+        payload[0:2] = b"\x01\x01"
+        struct.pack_into("<4I2H", payload, 4, 11, 22, 33, 44, 2, 3)
+        payload[24] = 2
+        struct.pack_into("<IiI", payload, 28, 500, -6, 7)
+        client.request = lambda *_args, **_kwargs: bytes(payload)
+        self.assertEqual(client.link_status(), {
+            "up": True, "recovering": True, "local_session": 11,
+            "peer_session": 22, "next_tx_sequence": 33, "rx_base": 44,
+            "tx_pending": 2, "rx_pending": 3, "head_state": 2,
+            "head_age_ms": 500, "last_error": -6, "recovery_count": 7,
+        })
 
     def test_wait_result_uses_operation_deadline_not_poll_timeout(self):
         client = DatlinkClient.__new__(DatlinkClient)

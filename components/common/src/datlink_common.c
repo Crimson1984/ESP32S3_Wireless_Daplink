@@ -70,6 +70,7 @@ const char *datlink_status_name(datlink_status_t status)
     case DATLINK_ERR_LOADER: return "loader";
     case DATLINK_ERR_VERIFY: return "verify";
     case DATLINK_ERR_ABORTED: return "aborted";
+    case DATLINK_ERR_VERSION: return "protocol_version";
     default: return "unknown";
     }
 }

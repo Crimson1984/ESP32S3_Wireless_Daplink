@@ -3,7 +3,7 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-VERSION = 1
+VERSION = 2
 USB_PAYLOAD_MAX = 4096
 TARGET_MSPM0G3507 = 0x3507
 
@@ -19,6 +19,7 @@ USB_TARGET_RESET = 22
 USB_TARGET_READ_INFO = 23
 USB_LOADER_TEST = 24
 USB_TARGET_BACKUP_START = 25
+USB_TRANSPORT_RECOVER = 26
 USB_RESPONSE = 0x80
 USB_EVENT = 0x81
 
@@ -28,10 +29,12 @@ MSG_TARGET_INFO = 24
 MSG_LOADER_TEST = 25
 MSG_TARGET_BACKUP_DATA = 27
 MSG_TARGET_BACKUP_RESULT = 28
+MSG_COMMAND_ERROR = 29
 
 BACKUP_MAIN_SIZE = 0x20000
 BACKUP_DATA_MAX = 180
 BACKUP_RESULT_LEN = 60
+COMMAND_ERROR_LEN = 20
 
 
 def crc32c(data: bytes, seed: int = 0) -> int:
@@ -104,7 +107,11 @@ class UsbFrame:
         if len(raw) < 16:
             raise ValueError("short USB frame")
         version, frame_type, flags, request_id, length = struct.unpack_from("<BBHII", raw)
-        if version != VERSION or length > USB_PAYLOAD_MAX or len(raw) != 16 + length:
+        if version != VERSION:
+            raise ValueError(
+                f"protocol version mismatch: gateway={version}, CLI={VERSION}; "
+                "flash matching Gateway and Probe v2 firmware")
+        if length > USB_PAYLOAD_MAX or len(raw) != 16 + length:
             raise ValueError("invalid USB frame header")
         expected, = struct.unpack_from("<I", raw, 12 + length)
         if crc32c(raw[:12 + length]) != expected:
@@ -141,6 +148,14 @@ def decode_status_payload(payload: bytes) -> tuple[int, bytes]:
         raise ValueError("response has no status")
     status, = struct.unpack_from("<i", payload)
     return status, payload[4:]
+
+
+def decode_command_error(payload: bytes) -> tuple[int, int, int, int, int]:
+    if len(payload) != COMMAND_ERROR_LEN:
+        raise ValueError("invalid COMMAND_ERROR payload")
+    session, sequence, message_type, status, detail = struct.unpack(
+        "<IIB3xiI", payload)
+    return session, sequence, message_type, status, detail
 
 
 def decode_backup_data(payload: bytes) -> tuple[int, int, bytes]:

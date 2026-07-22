@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wireless-datlink"
-version = "0.1.0"
+version = "0.2.0"
 description = "PC CLI for the ESP32-S3 Wireless DATLINK programmer"
 requires-python = ">=3.10"
 dependencies = ["pyserial>=3.5"]

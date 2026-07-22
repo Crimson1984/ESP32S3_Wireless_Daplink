@@ -34,6 +34,17 @@ class BackupResult:
     swd_clock_khz: int
 
 
+class RemoteCommandError(RuntimeError):
+    def __init__(self, payload: bytes):
+        session, sequence, message_type, status, detail = \
+            protocol.decode_command_error(payload)
+        super().__init__(
+            f"remote rejected message {message_type} at session=0x{session:08x} "
+            f"sequence={sequence}: status={status}, detail=0x{detail:08x}")
+        self.message_type = message_type
+        self.status = status
+
+
 class DatlinkClient:
     def __init__(self, port: str, baudrate: int = 115200, timeout: float = 3.0):
         try:
@@ -89,6 +100,8 @@ class DatlinkClient:
             if response.type == protocol.USB_EVENT:
                 status, event = protocol.decode_status_payload(response.payload)
                 if status == 0 and event:
+                    if event[0] == protocol.MSG_COMMAND_ERROR:
+                        raise RemoteCommandError(event[1:])
                     self.pending_events.append((event[0], event[1:]))
                 continue
             if response.type != protocol.USB_RESPONSE or response.request_id != self.request_id:
@@ -97,14 +110,44 @@ class DatlinkClient:
             if status != 0:
                 raise RuntimeError(f"gateway command failed: {status:#x}")
             return data
-        raise TimeoutError("gateway response timeout")
+        raise TimeoutError(
+            "gateway response timeout; if the CDC port is correct, flash matching "
+            "protocol v2 Gateway/Probe firmware (v1 does not answer v2 USB frames)")
 
     def info(self) -> dict[str, object]:
         return json.loads(self.request(protocol.USB_GET_INFO).decode("utf-8"))
 
     def link(self) -> bool:
+        return bool(self.link_status()["up"])
+
+    def link_status(self) -> dict[str, int | bool]:
         data = self.request(protocol.USB_GET_LINK_STATUS)
-        return bool(data and data[0])
+        if len(data) != 40:
+            raise ValueError("invalid protocol v2 link status payload")
+        local, peer, next_tx, rx_base = struct.unpack_from("<4I", data, 4)
+        tx_pending, rx_pending = struct.unpack_from("<2H", data, 20)
+        head_age, last_error, recoveries = struct.unpack_from("<IiI", data, 28)
+        return {
+            "up": bool(data[0]), "recovering": bool(data[1]),
+            "local_session": local, "peer_session": peer,
+            "next_tx_sequence": next_tx, "rx_base": rx_base,
+            "tx_pending": tx_pending, "rx_pending": rx_pending,
+            "head_state": data[24], "head_age_ms": head_age,
+            "last_error": last_error, "recovery_count": recoveries,
+        }
+
+    def recover(self, timeout: float = 6.0) -> dict[str, int | bool]:
+        before = self.link_status()["recovery_count"]
+        self.request(protocol.USB_TRANSPORT_RECOVER, timeout=2.0)
+        deadline = time.monotonic() + timeout
+        status: dict[str, int | bool] = {}
+        while time.monotonic() < deadline:
+            time.sleep(0.2)
+            status = self.link_status()
+            if status["up"] and not status["recovering"] and \
+                    status["recovery_count"] != before:
+                return status
+        raise TimeoutError(f"transport recovery did not complete: {status}")
 
     def stage(self, manifest: bytes, image: bytes) -> None:
         self.request(protocol.USB_IMAGE_BEGIN, manifest, 10.0)
@@ -141,12 +184,17 @@ class DatlinkClient:
                       f"status={progress.status} detail=0x{progress.detail:08x}")
                 if event_type == protocol.MSG_PROGRAM_RESULT:
                     return progress
+            if event_type == protocol.MSG_COMMAND_ERROR:
+                raise RemoteCommandError(data)
         raise TimeoutError("program operation did not finish")
 
     def wait_event(self, expected_type: int, timeout: float = 10.0) -> bytes:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             for index, (event_type, data) in enumerate(self.pending_events):
+                if event_type == protocol.MSG_COMMAND_ERROR:
+                    self.pending_events.pop(index)
+                    raise RemoteCommandError(data)
                 if event_type == expected_type:
                     self.pending_events.pop(index)
                     return data
@@ -160,6 +208,8 @@ class DatlinkClient:
                 continue
             status, event = protocol.decode_status_payload(frame.payload)
             if status == 0 and event:
+                if event[0] == protocol.MSG_COMMAND_ERROR:
+                    raise RemoteCommandError(event[1:])
                 if event[0] == expected_type:
                     return event[1:]
                 self.pending_events.append((event[0], event[1:]))
@@ -207,6 +257,9 @@ class DatlinkClient:
                 if progress is not None:
                     progress(len(image), protocol.BACKUP_MAIN_SIZE)
                 continue
+
+            if event_type == protocol.MSG_COMMAND_ERROR:
+                raise RemoteCommandError(payload)
 
             if event_type != protocol.MSG_TARGET_BACKUP_RESULT:
                 continue

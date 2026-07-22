@@ -1,5 +1,10 @@
 # Hardware and bring-up
 
+For a complete first-time installation and command workflow, see
+[getting-started.zh-CN.md](getting-started.zh-CN.md). For adding another ESP32
+pair or another MSPM0 target, see
+[device-extension.zh-CN.md](device-extension.zh-CN.md).
+
 ## Probe GPIO
 
 | ESP32-S3 | Direction | Function | Hardware note |

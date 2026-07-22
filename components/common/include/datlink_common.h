@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define DATLINK_PROTOCOL_VERSION 1U
+#define DATLINK_PROTOCOL_VERSION 2U
 #define DATLINK_SHA256_LEN 32U
 
 typedef enum {
@@ -36,6 +36,7 @@ typedef enum {
     DATLINK_ERR_LOADER = -14,
     DATLINK_ERR_VERIFY = -15,
     DATLINK_ERR_ABORTED = -16,
+    DATLINK_ERR_VERSION = -17,
 } datlink_status_t;
 
 uint16_t datlink_crc16_ccitt(const void *data, size_t length);
@@ -48,4 +49,3 @@ const char *datlink_status_name(datlink_status_t status);
 #ifdef __cplusplus
 }
 #endif
-

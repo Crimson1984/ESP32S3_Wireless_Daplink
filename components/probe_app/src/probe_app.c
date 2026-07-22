@@ -7,9 +7,22 @@
 #include "datlink_transport.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_system.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include "programmer.h"
 
 static const char *TAG = "probe_app";
+
+typedef struct {
+    datlink_wire_frame_t frame;
+    datlink_rx_token_t token;
+} app_rx_item_t;
+
+static QueueHandle_t s_app_rx_queue;
+static portMUX_TYPE s_active_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t s_active_type;
+static TickType_t s_active_since;
 
 static uint32_t get_u32(const uint8_t *p)
 {
@@ -116,9 +129,8 @@ static void backup_done_callback(
     }
 }
 
-static esp_err_t handle_message(const datlink_wire_frame_t *frame, void *context)
+static esp_err_t process_message(const datlink_wire_frame_t *frame)
 {
-    (void)context;
     switch (frame->type) {
     case DATLINK_MSG_IMAGE_BEGIN: {
         datlink_image_manifest_t manifest;
@@ -166,14 +178,122 @@ static esp_err_t handle_message(const datlink_wire_frame_t *frame, void *context
         return programmer_backup_start(get_u32(frame->payload),
                                        backup_data_callback,
                                        backup_done_callback, NULL);
+    case DATLINK_MSG_COMMAND_ERROR:
+        if (frame->payload_length != DATLINK_COMMAND_ERROR_WIRE_LEN) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if (frame->payload[8] == DATLINK_MSG_TARGET_BACKUP_DATA ||
+            frame->payload[8] == DATLINK_MSG_TARGET_BACKUP_RESULT) {
+            programmer_abort();
+        }
+        ESP_LOGW(TAG, "peer rejected type=%u status=%" PRId32 " detail=0x%08" PRIx32,
+                 frame->payload[8], (int32_t)get_u32(frame->payload + 12U),
+                 get_u32(frame->payload + 16U));
+        return ESP_OK;
     default:
         return ESP_ERR_NOT_SUPPORTED;
+    }
+}
+
+static datlink_status_t status_from_esp(esp_err_t err)
+{
+    switch (err) {
+    case ESP_OK: return DATLINK_OK;
+    case ESP_ERR_INVALID_ARG:
+    case ESP_ERR_INVALID_SIZE: return DATLINK_ERR_ARGUMENT;
+    case ESP_ERR_INVALID_STATE:
+    case ESP_ERR_NO_MEM: return DATLINK_ERR_STATE;
+    case ESP_ERR_TIMEOUT: return DATLINK_ERR_TIMEOUT;
+    case ESP_ERR_INVALID_CRC: return DATLINK_ERR_CRC;
+    default: return DATLINK_ERR_STORAGE;
+    }
+}
+
+static datlink_rx_disposition_t handle_message(
+    const datlink_wire_frame_t *frame, const datlink_rx_token_t *token,
+    void *context)
+{
+    (void)context;
+    const app_rx_item_t item = {.frame = *frame, .token = *token};
+    return xQueueSend(s_app_rx_queue, &item, 0) == pdTRUE
+               ? DATLINK_RX_ASYNC : DATLINK_RX_DEFER;
+}
+
+static void app_rx_task(void *argument)
+{
+    (void)argument;
+    app_rx_item_t item;
+    for (;;) {
+        if (xQueueReceive(s_app_rx_queue, &item, portMAX_DELAY) != pdTRUE) continue;
+        taskENTER_CRITICAL(&s_active_lock);
+        s_active_type = item.frame.type;
+        s_active_since = xTaskGetTickCount();
+        taskEXIT_CRITICAL(&s_active_lock);
+        const esp_err_t err = process_message(&item.frame);
+        (void)datlink_transport_complete_rx(&item.token, status_from_esp(err),
+                                            (uint32_t)err);
+        taskENTER_CRITICAL(&s_active_lock);
+        s_active_type = 0U;
+        taskEXIT_CRITICAL(&s_active_lock);
+    }
+}
+
+static void worker_watchdog_task(void *argument)
+{
+    (void)argument;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        uint8_t type;
+        TickType_t since;
+        taskENTER_CRITICAL(&s_active_lock);
+        type = s_active_type;
+        since = s_active_since;
+        taskEXIT_CRITICAL(&s_active_lock);
+        uint32_t limit_ms = type == DATLINK_MSG_LOADER_TEST ? 17000U : 12000U;
+        if ((type != DATLINK_MSG_TARGET_INFO && type != DATLINK_MSG_LOADER_TEST) ||
+            xTaskGetTickCount() - since < pdMS_TO_TICKS(limit_ms)) continue;
+
+        datlink_progress_t progress = {0};
+        (void)programmer_get_progress(&progress);
+        if (progress.phase == PROGRAMMER_PHASE_ERASE ||
+            progress.phase == PROGRAMMER_PHASE_PROGRAM ||
+            progress.phase == PROGRAMMER_PHASE_VERIFY) {
+            ESP_LOGE(TAG, "worker timeout during flash; automatic restart suppressed");
+            programmer_abort();
+            taskENTER_CRITICAL(&s_active_lock);
+            s_active_type = 0U;
+            taskEXIT_CRITICAL(&s_active_lock);
+            continue;
+        }
+        ESP_LOGE(TAG, "read-only worker timeout type=%u; restarting Probe", type);
+        programmer_abort();
+        vTaskDelay(pdMS_TO_TICKS(100));
+        esp_restart();
+    }
+}
+
+static void transport_event_handler(datlink_transport_event_t event, void *context)
+{
+    (void)context;
+    if (event == DATLINK_TRANSPORT_EVENT_PEER_EPOCH_RESET) {
+        if (programmer_is_busy()) {
+            ESP_LOGW(TAG, "Gateway epoch changed during target operation; staged image retained");
+        } else {
+            datlink_storage_invalidate();
+            ESP_LOGW(TAG, "Gateway epoch changed; incomplete staged image invalidated");
+        }
     }
 }
 
 esp_err_t probe_app_start(void)
 {
     ESP_RETURN_ON_ERROR(programmer_init(progress_callback, NULL), TAG, "programmer init");
+    s_app_rx_queue = xQueueCreate(8, sizeof(app_rx_item_t));
+    if (s_app_rx_queue == NULL) return ESP_ERR_NO_MEM;
     datlink_transport_set_handler(handle_message, NULL);
+    datlink_transport_set_event_handler(transport_event_handler, NULL);
+    if (xTaskCreatePinnedToCore(app_rx_task, "probe_app_rx", 8192, NULL, 7, NULL, 1) != pdPASS ||
+        xTaskCreatePinnedToCore(worker_watchdog_task, "probe_worker_wd", 3072, NULL, 5,
+                                NULL, 0) != pdPASS) return ESP_ERR_NO_MEM;
     return ESP_OK;
 }

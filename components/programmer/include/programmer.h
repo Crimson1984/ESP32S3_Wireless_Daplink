@@ -44,6 +44,7 @@ esp_err_t programmer_init(programmer_progress_cb_t callback, void *context);
 esp_err_t programmer_start(uint32_t operation_id);
 void programmer_abort(void);
 esp_err_t programmer_get_progress(datlink_progress_t *progress);
+bool programmer_is_busy(void);
 datlink_status_t programmer_read_target_info(
     programmer_target_info_t *info, programmer_target_diagnostic_t *diagnostic);
 datlink_status_t programmer_test_loader(

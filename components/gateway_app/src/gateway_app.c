@@ -23,9 +23,18 @@ typedef struct {
     uint32_t operation_id;
 } program_job_t;
 
+typedef struct {
+    datlink_wire_frame_t frame;
+    datlink_rx_token_t token;
+} app_rx_item_t;
+
 static const char *TAG = "gateway_app";
 static QueueHandle_t s_program_queue;
+static QueueHandle_t s_app_rx_queue;
 static datlink_progress_t s_progress;
+static portMUX_TYPE s_error_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_pending_command_error;
+static uint8_t s_command_error[DATLINK_COMMAND_ERROR_WIRE_LEN];
 
 static void put_u32(uint8_t *p, uint32_t v)
 {
@@ -95,9 +104,22 @@ static void send_progress_event(uint8_t event_type, const datlink_progress_t *pr
     if (length != 0U) (void)send_event(event_type, payload, length);
 }
 
-static esp_err_t transport_handler(const datlink_wire_frame_t *frame, void *context)
+static datlink_status_t status_from_esp(esp_err_t err)
 {
-    (void)context;
+    switch (err) {
+    case ESP_OK: return DATLINK_OK;
+    case ESP_ERR_INVALID_ARG:
+    case ESP_ERR_INVALID_SIZE: return DATLINK_ERR_ARGUMENT;
+    case ESP_ERR_INVALID_STATE:
+    case ESP_ERR_NO_MEM: return DATLINK_ERR_STATE;
+    case ESP_ERR_TIMEOUT: return DATLINK_ERR_TIMEOUT;
+    case ESP_ERR_INVALID_CRC: return DATLINK_ERR_CRC;
+    default: return DATLINK_ERR_LINK;
+    }
+}
+
+static esp_err_t process_transport_frame(const datlink_wire_frame_t *frame)
+{
     if (frame->type == DATLINK_MSG_PROGRAM_PROGRESS ||
         frame->type == DATLINK_MSG_PROGRAM_RESULT) {
         if (datlink_progress_decode(frame->payload, frame->payload_length,
@@ -114,11 +136,57 @@ static esp_err_t transport_handler(const datlink_wire_frame_t *frame, void *cont
     }
     if (frame->type == DATLINK_MSG_TARGET_BACKUP_DATA ||
         frame->type == DATLINK_MSG_TARGET_BACKUP_RESULT) {
-        /* Backup chunks are not reproducible by a single query, so retain
-         * backpressure until the USB frame has actually been accepted. */
         return send_event(frame->type, frame->payload, frame->payload_length);
     }
+    if (frame->type == DATLINK_MSG_COMMAND_ERROR) {
+        if (frame->payload_length != DATLINK_COMMAND_ERROR_WIRE_LEN) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        const esp_err_t err = send_event(frame->type, frame->payload,
+                                         frame->payload_length);
+        if (err != ESP_OK) {
+            taskENTER_CRITICAL(&s_error_lock);
+            memcpy(s_command_error, frame->payload, sizeof(s_command_error));
+            s_pending_command_error = true;
+            taskEXIT_CRITICAL(&s_error_lock);
+            ESP_LOGW(TAG, "cache COMMAND_ERROR until the next USB request");
+        }
+        return ESP_OK;
+    }
     return ESP_ERR_NOT_SUPPORTED;
+}
+
+static datlink_rx_disposition_t transport_handler(
+    const datlink_wire_frame_t *frame, const datlink_rx_token_t *token,
+    void *context)
+{
+    (void)context;
+    const app_rx_item_t item = {.frame = *frame, .token = *token};
+    return xQueueSend(s_app_rx_queue, &item, 0) == pdTRUE
+               ? DATLINK_RX_ASYNC : DATLINK_RX_DEFER;
+}
+
+static void app_rx_task(void *argument)
+{
+    (void)argument;
+    app_rx_item_t item;
+    for (;;) {
+        if (xQueueReceive(s_app_rx_queue, &item, portMAX_DELAY) != pdTRUE) continue;
+        const esp_err_t err = process_transport_frame(&item.frame);
+        (void)datlink_transport_complete_rx(&item.token, status_from_esp(err),
+                                            (uint32_t)err);
+    }
+}
+
+static void transport_event_handler(datlink_transport_event_t event, void *context)
+{
+    (void)context;
+    if (event == DATLINK_TRANSPORT_EVENT_LOCAL_EPOCH_RESET) {
+        s_progress.status = DATLINK_ERR_LINK;
+        s_progress.phase = 9U;
+        s_progress.detail = (uint32_t)event;
+        send_progress_event(DATLINK_MSG_PROGRAM_RESULT, &s_progress);
+    }
 }
 
 static esp_err_t transfer_image(uint32_t operation_id)
@@ -180,21 +248,53 @@ static void program_task(void *argument)
 static void usb_handler(const datlink_usb_frame_t *frame, void *context)
 {
     (void)context;
+    uint8_t pending_error[DATLINK_COMMAND_ERROR_WIRE_LEN];
+    bool have_error;
+    taskENTER_CRITICAL(&s_error_lock);
+    have_error = s_pending_command_error;
+    if (have_error) memcpy(pending_error, s_command_error, sizeof(pending_error));
+    taskEXIT_CRITICAL(&s_error_lock);
+    if (have_error && send_event(DATLINK_MSG_COMMAND_ERROR, pending_error,
+                                 sizeof(pending_error)) == ESP_OK) {
+        taskENTER_CRITICAL(&s_error_lock);
+        if (s_pending_command_error &&
+            memcmp(s_command_error, pending_error, sizeof(pending_error)) == 0) {
+            s_pending_command_error = false;
+        }
+        taskEXIT_CRITICAL(&s_error_lock);
+    }
     esp_err_t err = ESP_OK;
     switch (frame->type) {
     case DATLINK_USB_GET_INFO: {
         char info[192];
         snprintf(info, sizeof(info),
-                 "{\"role\":\"gateway\",\"session\":%" PRIu32
+                 "{\"role\":\"gateway\",\"protocol\":%u,\"session\":%" PRIu32
                  ",\"local\":\"" MACSTR "\",\"peer\":\"" MACSTR "\"}",
-                 datlink_transport_session_id(), MAC2STR(datlink_security_local_mac()),
+                 DATLINK_PROTOCOL_VERSION, datlink_transport_session_id(),
+                 MAC2STR(datlink_security_local_mac()),
                  MAC2STR(datlink_security_peer_mac()));
         send_response(frame->request_id, DATLINK_OK, info, strlen(info));
         return;
     }
     case DATLINK_USB_GET_LINK_STATUS: {
-        const uint8_t linked = datlink_transport_link_up() ? 1U : 0U;
-        send_response(frame->request_id, DATLINK_OK, &linked, sizeof(linked));
+        datlink_transport_status_t status;
+        datlink_transport_get_status(&status);
+        uint8_t payload[40] = {0};
+        payload[0] = status.up ? 1U : 0U;
+        payload[1] = status.recovering ? 1U : 0U;
+        put_u32(payload + 4U, status.local_session);
+        put_u32(payload + 8U, status.peer_session);
+        put_u32(payload + 12U, status.next_tx_sequence);
+        put_u32(payload + 16U, status.rx_base);
+        payload[20] = (uint8_t)status.tx_pending;
+        payload[21] = (uint8_t)(status.tx_pending >> 8);
+        payload[22] = (uint8_t)status.rx_pending;
+        payload[23] = (uint8_t)(status.rx_pending >> 8);
+        payload[24] = status.head_state;
+        put_u32(payload + 28U, status.head_age_ms);
+        put_u32(payload + 32U, (uint32_t)status.last_error);
+        put_u32(payload + 36U, status.recovery_count);
+        send_response(frame->request_id, DATLINK_OK, payload, sizeof(payload));
         return;
     }
     case DATLINK_USB_IMAGE_BEGIN: {
@@ -257,6 +357,9 @@ static void usb_handler(const datlink_usb_frame_t *frame, void *context)
                                          pdMS_TO_TICKS(100));
         }
         break;
+    case DATLINK_USB_TRANSPORT_RECOVER:
+        err = datlink_transport_recover();
+        break;
     default:
         err = ESP_ERR_NOT_SUPPORTED;
         break;
@@ -267,10 +370,13 @@ static void usb_handler(const datlink_usb_frame_t *frame, void *context)
 esp_err_t gateway_app_start(void)
 {
     s_program_queue = xQueueCreate(2, sizeof(program_job_t));
-    if (s_program_queue == NULL) return ESP_ERR_NO_MEM;
+    s_app_rx_queue = xQueueCreate(8, sizeof(app_rx_item_t));
+    if (s_program_queue == NULL || s_app_rx_queue == NULL) return ESP_ERR_NO_MEM;
     datlink_transport_set_handler(transport_handler, NULL);
+    datlink_transport_set_event_handler(transport_event_handler, NULL);
     ESP_RETURN_ON_ERROR(gateway_usb_init(usb_handler, NULL), TAG, "USB init");
-    if (xTaskCreatePinnedToCore(program_task, "gateway_program", 8192, NULL, 6, NULL, 1) != pdPASS) {
+    if (xTaskCreatePinnedToCore(program_task, "gateway_program", 8192, NULL, 6, NULL, 1) != pdPASS ||
+        xTaskCreatePinnedToCore(app_rx_task, "gateway_app_rx", 6144, NULL, 7, NULL, 1) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;

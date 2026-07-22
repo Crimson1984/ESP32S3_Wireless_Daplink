@@ -10,10 +10,12 @@ same source tree:
   transactions and Flash operations execute locally.
 
 The project uses ESP-IDF 6.0, CMake and Ninja directly. PlatformIO is not used.
+Gateway, Probe and the PC CLI currently use protocol version 2 and must be
+upgraded together.
 
 ## Safety boundary
 
-The first version only accepts MSPM0G3507 MAIN Flash addresses
+The current target implementation only accepts MSPM0G3507 MAIN Flash addresses
 `0x00000000..0x0001FFFF`. It never intentionally writes BCR, BSL configuration
 or NONMAIN, never requests mass erase/factory reset, and never automatically
 unlocks a protected target. The full image must be present and SHA-256 verified
@@ -115,6 +117,8 @@ Use the Gateway native OTG CDC COM port, not CH343 COM8:
 ```powershell
 datlink --port COMx info
 datlink --port COMx link
+datlink --port COMx link --json
+datlink --port COMx recover
 datlink --port COMx target-info
 datlink --port COMx loader-test
 datlink --port COMx backup backups\mspm0g3507-main.bin
@@ -136,6 +140,10 @@ default, compares every byte and both SHA-256 digests, and only then finalizes
 the requested output file. Existing files are not replaced unless `--force`
 is supplied. The Probe issues a system reset after every pass.
 
+A short or sparse image erases every 1 KiB sector it touches. Bytes in the same
+erased sector that are not present in an input segment remain `0xFF`; use a full
+128 KiB backup for exact restoration.
+
 ## Verification
 
 Pure software checks:
@@ -153,6 +161,10 @@ They do not replace real ESP-NOW, USB, SWD timing or Flash endurance testing.
 ## Documentation
 
 - [Changelog](CHANGELOG.md)
+- [中文完整安装与使用指南](docs/getting-started.zh-CN.md)
+- [通用烧录命令中文说明](docs/cli-reference.zh-CN.md)
+- [新增ESP32设备与MSPM0目标型号扩展指南](docs/device-extension.zh-CN.md)
+- [实机验证记录](docs/validation-log.zh-CN.md)
 - [Architecture and module ownership](docs/architecture.md)
 - [USB, ESP-NOW and image protocol](docs/protocol.md)
 - [LaunchPad wiring and hardware bring-up](docs/hardware.md)

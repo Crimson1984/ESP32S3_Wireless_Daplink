@@ -19,8 +19,8 @@ esp_err_t datlink_storage_read(uint32_t offset, void *data, size_t length);
 bool datlink_storage_ready(void);
 uint32_t datlink_storage_bytes_written(void);
 const datlink_image_manifest_t *datlink_storage_manifest(void);
+void datlink_storage_invalidate(void);
 
 #ifdef __cplusplus
 }
 #endif
-

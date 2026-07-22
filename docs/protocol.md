@@ -2,7 +2,8 @@
 
 All multibyte values are unsigned little-endian unless explicitly stated. Wire
 records are encoded field by field; C structure layout is never the protocol.
-Protocol version is currently `1`.
+Protocol version is currently `2`. Version 1 nodes are deliberately rejected;
+the Gateway, Probe and Python CLI must be upgraded together.
 
 ## PC USB CDC
 
@@ -19,7 +20,8 @@ response payload begins with signed `status:i32`. An event additionally contains
 
 Commands are `GET_INFO`, `GET_LINK_STATUS`, `IMAGE_BEGIN`, `IMAGE_DATA`,
 `IMAGE_END`, `PROGRAM_START`, `PROGRAM_ABORT`, `GET_PROGRESS`, `TARGET_RESET`,
-`TARGET_READ_INFO`, `LOADER_TEST` and `TARGET_BACKUP_START`.
+`TARGET_READ_INFO`, `LOADER_TEST`, `TARGET_BACKUP_START` and
+`TRANSPORT_RECOVER`.
 
 `TARGET_READ_INFO` completes asynchronously with a `TARGET_INFO` event.  Its
 payload starts with a signed little-endian `datlink_status_t`.  On success the
@@ -70,12 +72,32 @@ payload[0..192] crc32c:u32
 - Up to four reliable application frames can await application ACK.
 - Initial RTO is 50 ms; maximum attempts are eight.
 - Heartbeat is 500 ms and link timeout is 3000 ms.
-- `ack_base` acknowledges every sequence at or below the base.
-- Bit zero in `ack_bitmap` acknowledges `ack_base + 1`.
-- The Probe advances ACK only after its application handler has persisted image
-  data to Flash.
+- `ack_base` acknowledges every committed sequence at or below the base.
+- Bit zero in `ack_bitmap` acknowledges committed `ack_base + 1`.
+- Received, deferred and in-progress slots are never acknowledged.
+- The Probe advances ACK only after its application worker has persisted image
+  data to Flash. A duplicate cannot invoke an in-progress worker twice.
 - ESP-NOW's send callback only releases the physical sender; it is not an
   application ACK.
+
+Application work returns asynchronously through an RX token. Permanent errors
+are converted into reliable `COMMAND_ERROR` messages before the rejected input
+sequence is committed:
+
+```text
+origin_session:u32 origin_sequence:u32 origin_type:u8 reserved:bytes[3]
+status:i32 detail:u32
+```
+
+An ordered-head gap starts a sequence-zero `RESYNC_REQUEST`/`RESYNC_REPLY`
+exchange. If the sender still retains the missing frame it retransmits it
+immediately. Otherwise it creates a new directional session epoch and restarts
+at sequence one. A manual `TRANSPORT_RECOVER` performs the same authenticated
+handshake without resetting or erasing the MSPM0 target.
+
+The gap timer must not run merely because later frames are buffered: recovery
+starts only if `ack_base + 1` is absent from every RX slot. A present
+`IN_PROGRESS` head is application latency, not packet loss.
 
 PMK and LMK are both 16 bytes. Only the compiled peer MAC is registered and
 receive callbacks reject all other source MACs.

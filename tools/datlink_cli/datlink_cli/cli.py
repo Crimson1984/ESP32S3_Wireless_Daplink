@@ -24,7 +24,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("ports", help="list serial ports")
     sub.add_parser("info")
-    sub.add_parser("link")
+    link = sub.add_parser("link")
+    link.add_argument("--json", action="store_true", help="show protocol v2 recovery details")
+    sub.add_parser("recover", help="rebuild both ESP-NOW sequence epochs without resetting MSPM0")
     program = sub.add_parser("program")
     program.add_argument("image")
     program.add_argument("--base", type=parse_int)
@@ -63,6 +65,7 @@ STATUS_NAMES = {
     -8: "target_power/VTref", -9: "swd_ack_wait",
     -10: "swd_ack_fault", -11: "swd_parity", -12: "target_id",
     -13: "target_locked", -14: "loader", -15: "verify", -16: "aborted",
+    -17: "protocol_version",
 }
 
 STAGE_NAMES = {
@@ -109,9 +112,17 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "info":
                 print(json.dumps(client.info(), indent=2))
             elif args.command == "link":
-                linked = client.link()
-                print("up" if linked else "down")
-                return 0 if linked else 1
+                status = client.link_status()
+                if args.json:
+                    print(json.dumps(status, indent=2))
+                else:
+                    suffix = " (recovering)" if status["recovering"] else ""
+                    if status["last_error"] == -17:
+                        suffix = " (protocol version mismatch; update Gateway and Probe together)"
+                    print(("up" if status["up"] else "down") + suffix)
+                return 0 if status["up"] else 1
+            elif args.command == "recover":
+                print(json.dumps(client.recover(), indent=2))
             elif args.command == "program":
                 operation_id = args.operation_id or secrets.randbits(32) or 1
                 manifest, image = protocol.encode_manifest(
@@ -133,12 +144,22 @@ def main(argv: list[str] | None = None) -> int:
                 client.request(protocol.USB_PROGRAM_ABORT)
                 print("abort requested")
             elif args.command == "target-info":
-                client.request(protocol.USB_TARGET_READ_INFO)
-                data = client.wait_event(protocol.MSG_TARGET_INFO)
+                try:
+                    client.request(protocol.USB_TARGET_READ_INFO)
+                    data = client.wait_event(protocol.MSG_TARGET_INFO)
+                except TimeoutError:
+                    client.recover()
+                    client.request(protocol.USB_TARGET_READ_INFO)
+                    data = client.wait_event(protocol.MSG_TARGET_INFO)
                 print(json.dumps(decode_target_result(data, "target probe"), indent=2))
             elif args.command == "loader-test":
-                client.request(protocol.USB_LOADER_TEST)
-                data = client.wait_event(protocol.MSG_LOADER_TEST)
+                try:
+                    client.request(protocol.USB_LOADER_TEST)
+                    data = client.wait_event(protocol.MSG_LOADER_TEST)
+                except TimeoutError:
+                    client.recover()
+                    client.request(protocol.USB_LOADER_TEST)
+                    data = client.wait_event(protocol.MSG_LOADER_TEST)
                 result = decode_target_result(data, "SRAM loader test")
                 result["loader_test"] = "passed"
                 result["flash_modified"] = False

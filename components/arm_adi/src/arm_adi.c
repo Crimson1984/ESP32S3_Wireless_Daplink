@@ -23,6 +23,9 @@
 #define CTRLSTAT_POWER_REQ 0x50000000U
 #define CTRLSTAT_POWER_ACK 0xA0000000U
 #define MEMAP_CSW_32_AUTOINC 0x23000052U
+#define RESET_RELEASE_SETTLE_MS 10U
+#define AP_IDR_RECOVERY_RETRIES 100U
+#define AP_IDR_RETRY_DELAY_MS 1U
 
 static const char *TAG = "arm_adi";
 static uint32_t s_selected = UINT32_MAX;
@@ -88,6 +91,44 @@ esp_err_t arm_adi_init(void)
     return swd_phy_init();
 }
 
+static datlink_status_t read_ap_idr_after_reset(uint32_t *value)
+{
+    datlink_status_t last_status = DATLINK_ERR_TIMEOUT;
+    uint32_t last_value = 0U;
+
+    for (unsigned retry = 0; retry < AP_IDR_RECOVERY_RETRIES; ++retry) {
+        last_value = 0U;
+        last_status = arm_adi_read_ap(AP_IDR, &last_value);
+        if (last_status == DATLINK_OK && last_value != 0U &&
+            last_value != UINT32_MAX) {
+            *value = last_value;
+            if (retry != 0U) {
+                ESP_LOGI(TAG, "MEM-AP recovered %u ms after reset release",
+                         retry * AP_IDR_RETRY_DELAY_MS);
+            }
+            return DATLINK_OK;
+        }
+
+        if (last_status != DATLINK_OK &&
+            last_status != DATLINK_ERR_SWD_ACK_WAIT &&
+            last_status != DATLINK_ERR_SWD_ACK_FAULT) {
+            *value = last_value;
+            return last_status;
+        }
+
+        /* A target can transiently return WAIT/FAULT while its debug power
+         * domain recovers after nRESET is released. Clear sticky DP state and
+         * force APBANKSEL to be written again before the next bounded trial. */
+        uint32_t clear = DP_ABORT_CLEAR_ALL;
+        (void)swd_phy_transfer(false, false, DP_ABORT, &clear);
+        s_selected = UINT32_MAX;
+        vTaskDelay(pdMS_TO_TICKS(AP_IDR_RETRY_DELAY_MS));
+    }
+
+    *value = last_value;
+    return last_status == DATLINK_OK ? DATLINK_ERR_TARGET_ID : last_status;
+}
+
 static datlink_status_t connect_at_speed(uint32_t khz, bool under_reset,
                                          arm_adi_info_t *info)
 {
@@ -136,12 +177,13 @@ static datlink_status_t connect_at_speed(uint32_t khz, bool under_reset,
      * under reset, then release before selecting and validating the AP. */
     if (under_reset) {
         swd_phy_assert_reset(false);
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(pdMS_TO_TICKS(RESET_RELEASE_SETTLE_MS));
     }
 
     uint32_t ap_idr = 0;
     if (info != NULL) info->stage = ARM_ADI_STAGE_AP_IDR;
-    status = arm_adi_read_ap(AP_IDR, &ap_idr);
+    status = under_reset ? read_ap_idr_after_reset(&ap_idr)
+                         : arm_adi_read_ap(AP_IDR, &ap_idr);
     if (info != NULL) info->ap_idr = ap_idr;
     if (status != DATLINK_OK) return status;
     if (ap_idr == 0U || ap_idr == UINT32_MAX) return DATLINK_ERR_TARGET_ID;

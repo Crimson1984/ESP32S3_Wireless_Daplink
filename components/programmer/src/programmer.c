@@ -363,6 +363,15 @@ esp_err_t programmer_get_progress(datlink_progress_t *progress)
     return ESP_OK;
 }
 
+bool programmer_is_busy(void)
+{
+    if (s_lock == NULL) return false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    const bool busy = s_task != NULL;
+    xSemaphoreGive(s_lock);
+    return busy;
+}
+
 datlink_status_t programmer_read_target_info(
     programmer_target_info_t *info, programmer_target_diagnostic_t *diagnostic)
 {

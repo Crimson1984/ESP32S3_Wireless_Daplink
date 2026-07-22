@@ -6,6 +6,7 @@ sdkconfig
 sdkconfig.old
 generated/
 secrets.local.json
+secrets.*.local.json
 .venv/
 *.egg-info/
 __pycache__/

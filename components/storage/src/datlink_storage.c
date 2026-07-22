@@ -120,3 +120,9 @@ esp_err_t datlink_storage_finalize(void)
 bool datlink_storage_ready(void) { return s_ready; }
 uint32_t datlink_storage_bytes_written(void) { return s_written; }
 const datlink_image_manifest_t *datlink_storage_manifest(void) { return &s_manifest; }
+void datlink_storage_invalidate(void)
+{
+    s_ready = false;
+    s_written = 0U;
+    memset(&s_manifest, 0, sizeof(s_manifest));
+}

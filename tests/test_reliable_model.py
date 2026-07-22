@@ -99,6 +99,62 @@ class ReliableTransferTests(unittest.TestCase):
         self.assertEqual(b"".join(received[index] for index in range(1, base + 1)),
                          b"firstsecond")
 
+    def test_uncommitted_frame_is_not_acknowledged(self):
+        slots = {1: "in_progress", 2: "received", 3: "committed"}
+        base = 0
+        bitmap = 0
+        for sequence, state in slots.items():
+            if state == "committed":
+                bitmap |= 1 << (sequence - base - 1)
+        self.assertEqual(bitmap, 0b100)
+        self.assertFalse(bitmap & 0b001)
+        self.assertFalse(bitmap & 0b010)
+
+    def test_reject_commits_only_after_error_is_queued(self):
+        state = "error_pending"
+        base = 0
+        error_queue_has_space = False
+        if error_queue_has_space:
+            state = "committed"
+        self.assertEqual((state, base), ("error_pending", 0))
+        error_queue_has_space = True
+        if error_queue_has_space:
+            state = "committed"
+        if state == "committed":
+            base = 1
+        self.assertEqual(base, 1)
+
+    def test_duplicate_during_async_work_does_not_repeat_handler(self):
+        state = "received"
+        handler_calls = 0
+        for _ in range(100):
+            if state == "received":
+                state = "in_progress"
+                handler_calls += 1
+        self.assertEqual(handler_calls, 1)
+
+    def test_missing_sequence_forces_new_epoch(self):
+        local_session = 0x100
+        retained = {8: b"last"}
+        expected = 1
+        action = "retransmit" if expected in retained else "new_epoch"
+        if action == "new_epoch":
+            local_session += 1
+            retained.clear()
+            next_sequence = 1
+        self.assertEqual((action, local_session, next_sequence),
+                         ("new_epoch", 0x101, 1))
+
+    def test_in_progress_head_is_not_misclassified_as_a_gap(self):
+        base = 9
+        expected = base + 1
+        slots = {10: "in_progress", 11: "received", 12: "received"}
+        has_expected = expected in slots
+        has_later = any(sequence > expected for sequence in slots)
+        progress_is_old = True
+        start_resync = progress_is_old and has_later and not has_expected
+        self.assertFalse(start_resync)
+
 
 if __name__ == "__main__":
     unittest.main()

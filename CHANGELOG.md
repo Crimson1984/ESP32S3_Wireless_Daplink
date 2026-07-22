@@ -10,12 +10,31 @@ backward compatibility between protocol revisions.
 
 ### Added
 
+- Added protocol v2 transport recovery with committed-only ACKs, asynchronous
+  application RX tokens, reliable command-error events, directional session
+  resynchronization, detailed link diagnostics and `datlink recover`.
 - Planned IDE integration path for using the existing CLI as a VSCode/CCS
   external downloader and for adding a future GDB server or CMSIS-DAP v2
   debugging backend.
+- Added a Chinese command reference covering ESP32-S3 firmware updates, every
+  current `datlink` command, supported image formats, backup/restore, batch
+  programming, safety limits and the current CCS/VSCode integration boundary.
+- Added detailed Chinese installation/use, hardware-pair/target-device
+  extension, and dated hardware-validation guides.
 
 ### Fixed
 
+- Prevented the gap watchdog from rotating a sender epoch while the expected
+  ordered frame is present and still being committed by the application
+  worker, which could abort a healthy pipelined image transfer.
+- Removed the permanent ordered-head deadlock caused by an application handler
+  rejecting a frame that had already appeared in the ACK bitmap. Gateway and
+  Probe now process radio commands on dedicated workers, never execute an
+  in-progress duplicate twice, and automatically recover missing sequence
+  epochs after a one-sided restart.
+- Added a bounded MEM-AP recovery window after releasing target nRESET. AP IDR
+  now retries transient WAIT/FAULT responses with sticky-error clearing and
+  APBANKSEL re-selection instead of failing on the first 2 ms access.
 - Kept CLI asynchronous waits alive across individual 2-second serial polling
   timeouts, so `target-info`, Loader tests and programming results use their
   full operation deadline instead of reporting a false Gateway timeout.
@@ -26,16 +45,25 @@ backward compatibility between protocol revisions.
 
 ### Validation pending
 
-- Flash the latest Probe firmware containing the reset-run change and confirm
-  that a freshly programmed target starts without pressing the LaunchPad reset
-  button.
-- Flash the Gateway and Probe timeout-recovery fixes and complete 50 consecutive
-  `target-info` operations without power-cycling either ESP32-S3.
 - Complete 20 consecutive full-application program/readback/reset cycles.
 - Complete the remaining negative tests for unpowered, protected, malformed,
   interrupted and timeout cases.
 - Implement and validate IDE debugging features such as single-step,
   breakpoints, watchpoints and GDB Remote Serial Protocol.
+
+### Hardware validation
+
+- Completed the continuous, mixed-command and recovery test sequences with
+  protocol v2 without reproducing a permanent ordered-head blockage.
+- Built and programmed TI DriverLib `gpio_toggle_output` (472 bytes) and
+  `tima_timer_mode_periodic_repeat_count` (992 bytes); both completed erase,
+  program, MEM-AP readback verification and automatic reset-run.
+- Independently read the complete MAIN Flash twice after the TimerA example;
+  both passes produced SHA-256
+  `b5661e3f28288e2184e2a4bcd974c133442074797d9df28279764aa75fdc5e43`,
+  and the first 992 bytes matched the OUT load segment exactly.
+- Preserved the pre-test 128 KiB image with SHA-256
+  `d3e5bf55c6b1a7235611e4f55df119da509a152d1d7c973a1808181855f2a8a3`.
 
 ## [0.1.0] - 2026-07-20
 
@@ -125,5 +153,7 @@ backward compatibility between protocol revisions.
 - The system is currently a programmer, not a selectable VSCode/CCS debugger.
 - Dynamic pairing, signed images, target power control and multi-target support
   are not implemented.
-- Only sectors covered by the incoming image are erased; stale data outside the
-  image remains unchanged by design.
+- Only sectors touched by the incoming image are erased. Data outside those
+  sectors remains unchanged, but bytes inside an erased sector that are absent
+  from all input segments remain `0xFF`; sector read-modify-write is not yet
+  implemented.
